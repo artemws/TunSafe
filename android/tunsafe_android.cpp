@@ -1,16 +1,12 @@
 // tunsafe_android.cpp
-// Implements the TunSafe* C functions declared in tunsafe_jni.cpp.
-// Wraps the tunsafe_amalgam.cpp core for Android.
-//
-// Build note: compiled together with tunsafe_amalgam.cpp via CMakeLists.txt.
+// Implements TunSafe* C functions declared in tunsafe_jni.cpp.
+// Compiled with tunsafe_core.cpp (Android-only source list) via CMakeLists.txt.
 
 #include "build_config.h"
 #include "tunsafe_types.h"
 #include "wireguard.h"
 #include "wireguard_config.h"
-#include "wireguard_proto.h"
 #include "tunsafe_threading.h"
-#include "tunsafe_cpu.h"
 #include "util.h"
 #include "crypto/curve25519/curve25519-donna.h"
 
@@ -21,9 +17,6 @@
 #include <cstdlib>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
 
 #define LOG_TAG "TunSafeCore"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -64,6 +57,17 @@ extern "C" void TunSafeSetCallbacks(
     g_releaseFd         = releaseFd;
 }
 
+// Public accessors for the WireGuard engine (called from network_android.cpp)
+int AndroidConfigureTun(const char* config) {
+    return g_configureTun ? g_configureTun(config) : -1;
+}
+void AndroidOnConnected()                           { if (g_onConnected)       g_onConnected(); }
+void AndroidOnConnectionRetry(int delay)            { if (g_onConnectionRetry) g_onConnectionRetry(delay); }
+void AndroidOnPingReply(const char* ip, int ms)     { if (g_onPingReply)       g_onPingReply(ip, ms); }
+void AndroidOnRequestToken(int type)                { if (g_onRequestToken)    g_onRequestToken(type); }
+void AndroidProtectFd(int fd)                       { if (g_protectFd)         g_protectFd(fd); }
+bool AndroidReleaseFd(int fd)                       { return g_releaseFd ? g_releaseFd(fd) : false; }
+
 // ── Log ring buffer ───────────────────────────────────────────────────────────
 
 static pthread_mutex_t g_log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -74,204 +78,115 @@ static void AppendLog(const char* line) {
     pthread_mutex_lock(&g_log_mutex);
     g_log_buf += line;
     g_log_buf += '\n';
-    if (g_log_buf.size() > LOG_MAX) {
-        // Keep last half
+    if (g_log_buf.size() > LOG_MAX)
         g_log_buf = g_log_buf.substr(g_log_buf.size() - LOG_MAX / 2);
-    }
     pthread_mutex_unlock(&g_log_mutex);
     LOGI("%s", line);
 }
 
-// Hook for TunSafe core logging (implement the weak symbol used by util.cpp)
-extern "C" void LogLine(const char* line) {
-    AppendLog(line);
-}
+// Hook called from util.cpp
+extern "C" void LogLine(const char* line) { AppendLog(line); }
 
 extern "C" char* TunSafeGetLog() {
     pthread_mutex_lock(&g_log_mutex);
-    char* result = strdup(g_log_buf.c_str());
+    char* r = strdup(g_log_buf.c_str());
     pthread_mutex_unlock(&g_log_mutex);
-    return result;
+    return r;
 }
 
 // ── Stats ─────────────────────────────────────────────────────────────────────
 
 static pthread_mutex_t g_stats_mutex = PTHREAD_MUTEX_INITIALIZER;
-static int64_t g_rx_bytes = 0, g_tx_bytes = 0, g_conn_time = 0;
+static int64_t g_rx = 0, g_tx = 0, g_conn_time = 0;
 
 extern "C" void TunSafeGetStats(int64_t* rx, int64_t* tx, int64_t* conn_time) {
     pthread_mutex_lock(&g_stats_mutex);
-    *rx        = g_rx_bytes;
-    *tx        = g_tx_bytes;
-    *conn_time = g_conn_time;
+    *rx = g_rx; *tx = g_tx; *conn_time = g_conn_time;
     pthread_mutex_unlock(&g_stats_mutex);
 }
 
-// Called by the network backend to update stats
-void UpdateStats(int64_t rx, int64_t tx, int64_t conn_time_sec) {
+// Called from the network backend to update stats
+void AndroidUpdateStats(int64_t rx, int64_t tx, int64_t conn_time_sec) {
     pthread_mutex_lock(&g_stats_mutex);
-    g_rx_bytes  = rx;
-    g_tx_bytes  = tx;
-    g_conn_time = conn_time_sec;
+    g_rx = rx; g_tx = tx; g_conn_time = conn_time_sec;
     pthread_mutex_unlock(&g_stats_mutex);
 }
 
 // ── Engine thread ─────────────────────────────────────────────────────────────
+// network_android.cpp provides WireGuardNetworkStart which runs the event loop.
+// Forward declarations — implemented in network_android.cpp
 
-struct EngineParams {
-    std::string config;
-    bool        kill_switch;
-};
+void WireGuardNetworkStart(const char* config, bool kill_switch);
+void WireGuardNetworkStop();
+bool WireGuardNetworkPing(const char* server);
+bool WireGuardNetworkSetPingServer(const char* server);
+void WireGuardNetworkRetryNow();
+void WireGuardNetworkSubmitToken(const char* token);
+void WireGuardNetworkCloseFd(int fd);
+void WireGuardNetworkPurgeFd(int fd);
+void WireGuardNetworkPostExit(bool graceful);
 
+struct EngineParams { std::string config; bool kill_switch; };
 static pthread_t g_engine_thread = 0;
 static bool      g_engine_running = false;
-
-// The WireGuard/TunSafe engine entry point.
-// network_bsd.cpp (Android flavour) calls g_configureTun, g_protectFd etc.
-// We need to forward those calls to the Java layer via our callback pointers.
-
-// These are weak-linked hooks called from the BSD network backend.
-// Override them here to route through our Java callbacks.
-
-extern "C" int  PlatformConfigureTun(const char* config) {
-    if (g_configureTun) return g_configureTun(config);
-    return -1;
-}
-
-extern "C" void PlatformOnConnected() {
-    if (g_onConnected) g_onConnected();
-}
-
-extern "C" void PlatformOnConnectionRetry(int delay) {
-    if (g_onConnectionRetry) g_onConnectionRetry(delay);
-}
-
-extern "C" void PlatformOnPingReply(const char* ip, int ms) {
-    if (g_onPingReply) g_onPingReply(ip, ms);
-}
-
-extern "C" void PlatformOnRequestToken(int type) {
-    if (g_onRequestToken) g_onRequestToken(type);
-}
-
-extern "C" void PlatformProtectFd(int fd) {
-    if (g_protectFd) g_protectFd(fd);
-}
-
-extern "C" bool PlatformReleaseFd(int fd) {
-    if (g_releaseFd) return g_releaseFd(fd);
-    return false;
-}
 
 static void* EngineThread(void* arg) {
     EngineParams* p = (EngineParams*)arg;
     AppendLog("TunSafe engine thread starting");
-
-    // The BSD network backend runs its own event loop.
-    // Include tunsafe_bsd.cpp's entry point:
-    extern int TunSafeRunBSD(const char* config, bool kill_switch);
-    int ret = TunSafeRunBSD(p->config.c_str(), p->kill_switch);
-
+    WireGuardNetworkStart(p->config.c_str(), p->kill_switch);
     AppendLog("TunSafe engine thread exiting");
     g_engine_running = false;
     delete p;
-    return (void*)(intptr_t)ret;
+    return nullptr;
 }
 
 extern "C" int TunSafeStart(const char* config, bool kill_switch) {
     if (g_engine_running) {
-        AppendLog("TunSafeStart: stopping previous engine");
-        TunSafeStop();
-        if (g_engine_thread) {
-            pthread_join(g_engine_thread, nullptr);
-            g_engine_thread = 0;
-        }
+        AppendLog("Stopping previous engine");
+        WireGuardNetworkStop();
+        if (g_engine_thread) { pthread_join(g_engine_thread, nullptr); g_engine_thread = 0; }
     }
-
     auto* p = new EngineParams{std::string(config), kill_switch};
     g_engine_running = true;
-
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-
     int ret = pthread_create(&g_engine_thread, &attr, EngineThread, p);
     pthread_attr_destroy(&attr);
-
-    if (ret != 0) {
-        LOGE("TunSafeStart: pthread_create failed: %s", strerror(ret));
-        g_engine_running = false;
-        delete p;
-        return -1;
-    }
-
-    AppendLog("TunSafeStart: engine launched");
+    if (ret != 0) { g_engine_running = false; delete p; return -1; }
     return 0;
 }
 
-extern "C" void TunSafeStop() {
-    extern void TunSafeStopBSD();
-    TunSafeStopBSD();
-}
-
-extern "C" void TunSafeRetryNow() {
-    extern void TunSafeRetryNowBSD();
-    TunSafeRetryNowBSD();
-}
-
-extern "C" void TunSafeCloseFd(int fd) {
-    extern void TunSafeCloseFdBSD(int);
-    TunSafeCloseFdBSD(fd);
-}
-
-extern "C" void TunSafePurgeFd(int fd) {
-    extern void TunSafePurgeFdBSD(int);
-    TunSafePurgeFdBSD(fd);
-}
-
-extern "C" void TunSafePostExit(bool graceful) {
-    extern void TunSafePostExitBSD(bool);
-    TunSafePostExitBSD(graceful);
-}
-
-extern "C" bool TunSafePing(const char* server) {
-    extern bool TunSafePingBSD(const char*);
-    return TunSafePingBSD(server);
-}
-
-extern "C" bool TunSafeSetPingServer(const char* server) {
-    extern bool TunSafeSetPingServerBSD(const char*);
-    return TunSafeSetPingServerBSD(server);
-}
-
-extern "C" void TunSafeSubmitToken(const char* token) {
-    extern void TunSafeSubmitTokenBSD(const char*);
-    TunSafeSubmitTokenBSD(token);
-}
+extern "C" void TunSafeStop()               { WireGuardNetworkStop(); }
+extern "C" void TunSafeRetryNow()           { WireGuardNetworkRetryNow(); }
+extern "C" void TunSafeCloseFd(int fd)      { WireGuardNetworkCloseFd(fd); }
+extern "C" void TunSafePurgeFd(int fd)      { WireGuardNetworkPurgeFd(fd); }
+extern "C" void TunSafePostExit(bool g)     { WireGuardNetworkPostExit(g); }
+extern "C" bool TunSafePing(const char* s)  { return WireGuardNetworkPing(s); }
+extern "C" bool TunSafeSetPingServer(const char* s) { return WireGuardNetworkSetPingServer(s); }
+extern "C" void TunSafeSubmitToken(const char* t)   { WireGuardNetworkSubmitToken(t); }
 
 // ── Key utilities ─────────────────────────────────────────────────────────────
 
-// Base64 encoding table
-static const char kBase64[] =
+static const char kB64[] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-static void base64_encode(const uint8_t* in, int in_len, char* out) {
+static void b64_encode(const uint8_t* in, int len, char* out) {
     int i = 0, j = 0;
-    while (in_len > 0) {
-        uint32_t b = (in_len > 0 ? in[i++] : 0) << 16 |
-                     (in_len > 1 ? in[i++] : 0) << 8  |
-                     (in_len > 2 ? in[i++] : 0);
-        out[j++] = kBase64[(b >> 18) & 0x3f];
-        out[j++] = kBase64[(b >> 12) & 0x3f];
-        out[j++] = in_len > 1 ? kBase64[(b >>  6) & 0x3f] : '=';
-        out[j++] = in_len > 2 ? kBase64[(b >>  0) & 0x3f] : '=';
-        in_len -= 3;
+    while (len > 0) {
+        uint32_t b = (uint32_t)in[i++] << 16 |
+                     (len > 1 ? (uint32_t)in[i++] : 0u) << 8 |
+                     (len > 2 ? (uint32_t)in[i++] : 0u);
+        out[j++] = kB64[(b >> 18) & 0x3f];
+        out[j++] = kB64[(b >> 12) & 0x3f];
+        out[j++] = len > 1 ? kB64[(b >>  6) & 0x3f] : '=';
+        out[j++] = len > 2 ? kB64[(b >>  0) & 0x3f] : '=';
+        len -= 3;
     }
     out[j] = '\0';
 }
 
-static int base64_decode(const char* in, uint8_t* out, int out_max) {
-    static const int8_t kDec[256] = {
+static int b64_decode(const char* in, uint8_t* out, int max) {
+    static const int8_t T[256] = {
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
         -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
@@ -282,10 +197,10 @@ static int base64_decode(const char* in, uint8_t* out, int out_max) {
         41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
     };
     int n = 0;
-    while (*in && n + 3 <= out_max) {
-        int a = kDec[(uint8_t)in[0]], b = kDec[(uint8_t)in[1]];
-        int c = in[2] == '=' ? 0 : kDec[(uint8_t)in[2]];
-        int d = in[3] == '=' ? 0 : kDec[(uint8_t)in[3]];
+    while (*in && n + 3 <= max) {
+        int a = T[(uint8_t)in[0]], b = T[(uint8_t)in[1]];
+        int c = in[2] == '=' ? 0 : T[(uint8_t)in[2]];
+        int d = in[3] == '=' ? 0 : T[(uint8_t)in[3]];
         if (a < 0 || b < 0) break;
         out[n++] = (a << 2) | (b >> 4);
         if (in[2] != '=') out[n++] = (b << 4) | (c >> 2);
@@ -297,39 +212,26 @@ static int base64_decode(const char* in, uint8_t* out, int out_max) {
 
 extern "C" void TunSafeGetPublicKey(const char* privkey_b64, char* out_buf) {
     uint8_t priv[32] = {}, pub[32] = {};
-    if (base64_decode(privkey_b64, priv, 32) == 32) {
-        // curve25519 scalar multiplication: pub = priv * G
-        // Using curve25519-donna from TunSafe's crypto/
-        extern void curve25519_donna(uint8_t*, const uint8_t*, const uint8_t*);
+    if (b64_decode(privkey_b64, priv, 32) == 32) {
         static const uint8_t basepoint[32] = {9};
-        curve25519_donna(pub, priv, basepoint);
-        base64_encode(pub, 32, out_buf);
+        // curve25519_donna_ref is a regular C++ function — call without extern "C"
+        curve25519_donna_ref(pub, priv, basepoint);
+        b64_encode(pub, 32, out_buf);
     } else {
         out_buf[0] = '\0';
     }
 }
 
 extern "C" void TunSafeGeneratePrivateKey(char* out_buf) {
-    uint8_t key[32];
-    // Read from /dev/urandom
-    int fd = open("/dev/urandom", O_RDONLY);
-    if (fd >= 0) {
-        read(fd, key, 32);
-        close(fd);
-    } else {
-        // Fallback: not cryptographically safe, but shouldn't happen on Android
-        for (int i = 0; i < 32; i++) key[i] = (uint8_t)(rand() >> 8);
-    }
-    // Apply WireGuard clamping
+    uint8_t key[32] = {};
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd >= 0) { (void)read(fd, key, 32); close(fd); }
     key[0]  &= 248;
     key[31] &= 127;
     key[31] |= 64;
-    base64_encode(key, 32, out_buf);
+    b64_encode(key, 32, out_buf);
 }
 
 extern "C" void TunSafeGetExternalIp(const char* /*server*/, char* out_buf, int out_len) {
-    // Minimal implementation: try to get the IP from the tunnel interface
-    // The real implementation would query a STUN/external service.
-    // For now return empty and let Java fall back to its own mechanism.
     if (out_len > 0) out_buf[0] = '\0';
 }
