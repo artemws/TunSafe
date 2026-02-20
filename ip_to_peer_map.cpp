@@ -106,7 +106,7 @@ static uint32 make_cidr_mask(uint8 cidr) {
 #define VALUE_FROM_OLEAF(n) ((void*)((intptr_t)(n) - 1))
 
 static RoutingTrie32::Node *NewNode(uint32 key, int pos, int bits) {
-  RoutingTrie32::Node *n = (RoutingTrie32::Node *)malloc(offsetof(RoutingTrie32::Node, child[(uint32)(1U << bits)]));
+  RoutingTrie32::Node *n = (RoutingTrie32::Node *)malloc(offsetof(RoutingTrie32::Node, child) + ((size_t)(1U << bits)) * sizeof(RoutingTrie32::Node*));
   if (n) {
     n->parent = NULL;
     n->pos = pos;
