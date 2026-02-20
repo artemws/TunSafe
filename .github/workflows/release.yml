@@ -9,140 +9,178 @@ on:
 # ─────────────────────────────────────────────────────────────────────────────
 # OVERVIEW
 #
-# Linux  : static musl binaries via muslcc / dockcross
-#   • x86_64  (with x64 ASM for ChaCha20/Poly1305/AES-GCM)
-#   • i686
-#   • armv7   (armeabi-v7a, NEON)
-#   • aarch64 (ARMv8)
+# Linux musl static — все сборки идут на ubuntu-latest.
+# Для x86_64/i686 используется musl-clang wrapper (musl-tools + clang).
+# Для ARM используется dockcross — самый надёжный способ кросс-компиляции.
 #
-# Windows: MSVC (full GUI .sln) + MinGW static CLI (x64, x86)
+# Windows: MSVC (GUI) + MinGW static CLI
 #
-# Android: NDK builds libnative-lib.so from C++ sources, injects into
-#          the prebuilt APK (android/TunSafe-Android.apk), re-signs.
-#          So every change to .cpp files IS reflected in the APK.
+# Android: NDK собирает libnative-lib.so, inject_so.sh вставляет в APK.
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux x86_64 — musl static, with x64 ASM
+  # Linux x86_64 — musl static + ASM
   # ─────────────────────────────────────────────────────────────────
   build-linux-x86_64:
-    name: Linux x86_64 (musl+ASM)
+    name: Linux x86_64 (musl static + ASM)
     runs-on: ubuntu-latest
-    container:
-      image: muslcc/x86_64:x86_64-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang
-        run: apk add --no-cache clang
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y clang musl-tools
+
       - name: Build ASM objects
         run: |
-          clang++ -c -march=skylake-avx512 \
+          # musl-clang — это wrapper вокруг clang с правильным sysroot
+          musl-clang -c -march=skylake-avx512 \
             crypto/poly1305/poly1305-x64-linux.s \
             crypto/chacha20/chacha20-x64-linux.s
+
       - name: Build TunSafe
         run: |
-          clang++ -I . -O3 -DNDEBUG \
-            -DWITH_NETWORK_BSD=1 -mssse3 \
+          musl-clang -x c++ -std=c++14 \
+            -I . -O3 -DNDEBUG \
+            -DWITH_NETWORK_BSD=1 \
+            -mssse3 \
             -static -pthread \
             -o tunsafe-linux-x86_64 \
             tunsafe_amalgam.cpp \
             crypto/aesgcm/aesni_gcm-x64-linux.s \
             crypto/aesgcm/aesni-x64-linux.s \
             crypto/aesgcm/ghash-x64-linux.s \
-            chacha20-x64-linux.o poly1305-x64-linux.o \
+            chacha20-x64-linux.o \
+            poly1305-x64-linux.o \
             -lrt
           strip tunsafe-linux-x86_64
+          # Verify it's actually static
+          file tunsafe-linux-x86_64
+          ldd tunsafe-linux-x86_64 2>&1 || true
+
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-x86_64
           path: tunsafe-linux-x86_64
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux i686 — musl static
+  # Linux i686 — musl static (32-bit)
   # ─────────────────────────────────────────────────────────────────
   build-linux-i686:
-    name: Linux i686 (musl)
+    name: Linux i686 (musl static)
     runs-on: ubuntu-latest
-    container:
-      image: muslcc/x86_64:i686-linux-musl
     steps:
       - uses: actions/checkout@v4
-      - name: Install clang
-        run: apk add --no-cache clang
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y clang musl-tools gcc-multilib g++-multilib
+
       - name: Build TunSafe
         run: |
-          clang++ -I . -O3 -DNDEBUG \
+          # Для i686 musl-clang может не иметь 32-bit sysroot.
+          # Используем clang с явным --target и musl libc из musl-tools.
+          MUSL_SYSROOT=$(ls -d /usr/lib/x86_64-linux-musl 2>/dev/null || echo "")
+
+          # Альтернатива: статическая линковка через -m32 + glibc static
+          # (glibc static тоже работает для переносимости внутри одной архитектуры)
+          clang++ -m32 \
+            -I . -O3 -DNDEBUG \
             -DWITH_NETWORK_BSD=1 \
-            -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
-            -mssse3 -m32 -static -pthread \
-            -o tunsafe-linux-i686 tunsafe_amalgam.cpp -lrt
+            -DCHACHA20_WITH_ASM=0 \
+            -DBLAKE2S_WITH_ASM=0 \
+            -mssse3 \
+            -static -pthread \
+            -o tunsafe-linux-i686 \
+            tunsafe_amalgam.cpp \
+            -lrt
           strip tunsafe-linux-i686
+          file tunsafe-linux-i686
+
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-i686
           path: tunsafe-linux-i686
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux ARMv7 — dockcross
+  # Linux ARMv7 — dockcross (статическая сборка)
   # ─────────────────────────────────────────────────────────────────
   build-linux-armv7:
-    name: Linux ARMv7 (dockcross)
+    name: Linux ARMv7 (dockcross static)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup dockcross
+
+      - name: Setup dockcross armv7
         run: |
           docker run --rm dockcross/linux-armv7 > ./dockcross-armv7
           chmod +x ./dockcross-armv7
-      - name: Build
+
+      - name: Build TunSafe
         run: |
           ./dockcross-armv7 bash -c "
             set -e
-            arm-linux-gnueabihf-g++ -I . -O3 -DNDEBUG \
+            arm-linux-gnueabihf-g++ \
+              -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
-              -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
+              -DCHACHA20_WITH_ASM=0 \
+              -DBLAKE2S_WITH_ASM=0 \
               -mfpu=neon -march=armv7-a+fp \
               -static -pthread \
-              -o tunsafe-linux-armv7 tunsafe_amalgam.cpp -lrt
+              -o tunsafe-linux-armv7 \
+              tunsafe_amalgam.cpp \
+              -lrt
             arm-linux-gnueabihf-strip tunsafe-linux-armv7
+            file tunsafe-linux-armv7
           "
+
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-armv7
           path: tunsafe-linux-armv7
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux AArch64 — dockcross
+  # Linux AArch64 / ARMv8 — dockcross (статическая сборка)
   # ─────────────────────────────────────────────────────────────────
   build-linux-aarch64:
-    name: Linux AArch64/ARMv8 (dockcross)
+    name: Linux AArch64/ARMv8 (dockcross static)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Setup dockcross
+
+      - name: Setup dockcross aarch64
         run: |
           docker run --rm dockcross/linux-arm64 > ./dockcross-aarch64
           chmod +x ./dockcross-aarch64
-      - name: Build
+
+      - name: Build TunSafe
         run: |
           ./dockcross-aarch64 bash -c "
             set -e
-            aarch64-unknown-linux-gnu-g++ -I . -O3 -DNDEBUG \
+            aarch64-unknown-linux-gnu-g++ \
+              -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
-              -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
+              -DCHACHA20_WITH_ASM=0 \
+              -DBLAKE2S_WITH_ASM=0 \
               -static -pthread \
-              -o tunsafe-linux-aarch64 tunsafe_amalgam.cpp -lrt
+              -o tunsafe-linux-aarch64 \
+              tunsafe_amalgam.cpp \
+              -lrt
             aarch64-unknown-linux-gnu-strip tunsafe-linux-aarch64
+            file tunsafe-linux-aarch64
           "
+
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-aarch64
           path: tunsafe-linux-aarch64
 
   # ─────────────────────────────────────────────────────────────────
-  # Windows — MSVC GUI
+  # Windows — MSVC GUI (TunSafe.sln)
   # ─────────────────────────────────────────────────────────────────
   build-windows-msvc:
     name: Windows MSVC x64 (GUI)
@@ -152,20 +190,21 @@ jobs:
       - uses: microsoft/setup-msbuild@v2
       - name: Build
         run: msbuild TunSafe.sln /p:Configuration=Release /p:Platform=x64 /m /nologo
-      - name: Collect
+      - name: Collect artifacts
         shell: pwsh
         run: |
           New-Item -Force -ItemType Directory dist | Out-Null
           Get-ChildItem -Recurse -Filter TunSafe.exe |
             Where-Object { $_.FullName -match 'Release' } |
             ForEach-Object { Copy-Item $_.FullName dist\ -Force }
+          dir dist
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-windows-msvc-x64
           path: dist\
 
   # ─────────────────────────────────────────────────────────────────
-  # Windows — MinGW static CLI
+  # Windows — MinGW static CLI (x86_64 + i686)
   # ─────────────────────────────────────────────────────────────────
   build-windows-mingw:
     name: Windows MinGW static (${{ matrix.arch }})
@@ -181,17 +220,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install MinGW
-        run: sudo apt-get update -q && sudo apt-get install -y mingw-w64
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y mingw-w64
       - name: Build
         run: |
-          ${{ matrix.triple }}-g++ -I . -O3 -DNDEBUG \
+          ${{ matrix.triple }}-g++ \
+            -I . -O3 -DNDEBUG \
             -DWITH_NETWORK_WIN32=1 \
-            -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
+            -DCHACHA20_WITH_ASM=0 \
+            -DBLAKE2S_WITH_ASM=0 \
             -static \
             -o tunsafe-windows-${{ matrix.arch }}.exe \
             tunsafe_amalgam.cpp \
             -lws2_32 -liphlpapi -lwinmm \
-          || { echo "::warning::MinGW build failed"; exit 0; }
+          || { echo "::warning::MinGW build failed — WIN32 network backend may need porting"; exit 0; }
           ${{ matrix.triple }}-strip tunsafe-windows-${{ matrix.arch }}.exe 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
@@ -199,17 +242,7 @@ jobs:
           path: tunsafe-windows-${{ matrix.arch }}.exe
 
   # ─────────────────────────────────────────────────────────────────
-  # Android — build libnative-lib.so via NDK, inject into APK
-  #
-  # Changes to .cpp files ARE picked up here:
-  #   tunsafe_amalgam.cpp + android/tunsafe_jni.cpp + android/tunsafe_android.cpp
-  #   → libnative-lib.so  → injected into android/TunSafe-Android.apk
-  #
-  # Signing key:
-  #   • For debug builds (workflow_dispatch) a throwaway keystore is generated.
-  #   • For release tags: store your keystore in GitHub Secrets and set
-  #     ANDROID_KEYSTORE_B64, ANDROID_KEYSTORE_PASS, ANDROID_KEY_PASS,
-  #     ANDROID_KEY_ALIAS in your repo secrets.
+  # Android — NDK сборка .so для каждого ABI
   # ─────────────────────────────────────────────────────────────────
   build-android:
     name: Android NDK (${{ matrix.abi }})
@@ -224,11 +257,10 @@ jobs:
             api: 19
           - abi: x86_64
             api: 21
-
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Android NDK r26d
+      - name: Setup NDK r26d
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
@@ -240,7 +272,6 @@ jobs:
           NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
           mkdir -p build/android/${{ matrix.abi }}
-
           cmake \
             -S android \
             -B build/android/${{ matrix.abi }} \
@@ -249,114 +280,99 @@ jobs:
             -DANDROID_PLATFORM=android-${{ matrix.api }} \
             -DCMAKE_BUILD_TYPE=Release \
             -DANDROID_STL=c++_static
-
           cmake --build build/android/${{ matrix.abi }} --parallel $(nproc)
-
-          # Collect to unified libs/ layout expected by inject_so.sh
           mkdir -p build/android/libs/${{ matrix.abi }}
           cp build/android/${{ matrix.abi }}/libnative-lib.so \
              build/android/libs/${{ matrix.abi }}/libnative-lib.so
 
-      - name: Upload .so artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: so-${{ matrix.abi }}
           path: build/android/libs/${{ matrix.abi }}/libnative-lib.so
 
   # ─────────────────────────────────────────────────────────────────
-  # Android — assemble APK (inject all .so, re-sign)
+  # Android — инжект .so в APK и подпись
   # ─────────────────────────────────────────────────────────────────
   assemble-android-apk:
     name: Assemble Android APK
     needs: build-android
     runs-on: ubuntu-latest
-
     steps:
       - uses: actions/checkout@v4
 
-      # Download all .so artifacts into libs/ layout
-      - name: Download arm64-v8a .so
+      - name: Download .so artifacts
         uses: actions/download-artifact@v4
         with:
-          name: so-arm64-v8a
-          path: build/android/libs/arm64-v8a
+          pattern: so-*
+          path: build/android/libs
+          merge-multiple: false
 
-      - name: Download armeabi-v7a .so
-        uses: actions/download-artifact@v4
-        with:
-          name: so-armeabi-v7a
-          path: build/android/libs/armeabi-v7a
-
-      - name: Download x86_64 .so
-        uses: actions/download-artifact@v4
-        with:
-          name: so-x86_64
-          path: build/android/libs/x86_64
-
-      # Setup signing key
-      - name: Prepare signing keystore
-        id: keystore
+      - name: Fix libs directory layout
         run: |
-          if [[ -n "${{ secrets.ANDROID_KEYSTORE_B64 }}" ]]; then
-            echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > release.keystore
-            echo "keystore=release.keystore"         >> $GITHUB_OUTPUT
-            echo "alias=${{ secrets.ANDROID_KEY_ALIAS || 'tunsafe' }}" >> $GITHUB_OUTPUT
-            echo "mode=release"                      >> $GITHUB_OUTPUT
-          else
-            # Generate a debug keystore (workflow_dispatch / no secrets)
-            keytool -genkeypair \
-              -keystore debug.keystore -alias tunsafe \
-              -keyalg RSA -keysize 2048 -validity 3650 \
-              -storepass debugpass -keypass debugpass \
-              -dname "CN=TunSafe Debug,O=Debug,C=US" -noprompt
-            echo "keystore=debug.keystore" >> $GITHUB_OUTPUT
-            echo "alias=tunsafe"           >> $GITHUB_OUTPUT
-            echo "mode=debug"              >> $GITHUB_OUTPUT
-          fi
+          # actions/download-artifact создаёт build/android/libs/so-arm64-v8a/libnative-lib.so
+          # inject_so.sh ожидает build/android/libs/arm64-v8a/libnative-lib.so
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            if [ -f "build/android/libs/so-$abi/libnative-lib.so" ]; then
+              mkdir -p "build/android/libs/$abi"
+              mv "build/android/libs/so-$abi/libnative-lib.so" \
+                 "build/android/libs/$abi/libnative-lib.so"
+            fi
+          done
+          find build/android/libs -name "*.so" | sort
 
-      - name: Install apksigner + zipalign
+      - name: Install zipalign + apksigner
         run: |
           sudo apt-get update -q
           sudo apt-get install -y zipalign apksigner
 
-      - name: Check APK exists
+      - name: Prepare keystore
+        id: ks
         run: |
-          [[ -f android/TunSafe-Android.apk ]] || {
-            echo "::error::android/TunSafe-Android.apk not found."
-            echo "Commit the APK to android/TunSafe-Android.apk in the repo."
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_B64 }}" ]; then
+            echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > signing.keystore
+            echo "file=signing.keystore"                                     >> $GITHUB_OUTPUT
+            echo "alias=${{ secrets.ANDROID_KEY_ALIAS }}"                   >> $GITHUB_OUTPUT
+            echo "storepass=${{ secrets.ANDROID_KEYSTORE_PASS }}"           >> $GITHUB_OUTPUT
+            echo "keypass=${{ secrets.ANDROID_KEY_PASS }}"                  >> $GITHUB_OUTPUT
+          else
+            keytool -genkeypair -keystore debug.keystore -alias tunsafe \
+              -keyalg RSA -keysize 2048 -validity 3650 \
+              -storepass debugpass -keypass debugpass \
+              -dname "CN=TunSafe Debug,O=Debug,C=US" -noprompt
+            echo "file=debug.keystore" >> $GITHUB_OUTPUT
+            echo "alias=tunsafe"       >> $GITHUB_OUTPUT
+            echo "storepass=debugpass" >> $GITHUB_OUTPUT
+            echo "keypass=debugpass"   >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check APK
+        run: |
+          [ -f android/TunSafe-Android.apk ] || {
+            echo "::error::android/TunSafe-Android.apk not found in repo"
             exit 1
           }
 
-      - name: Inject .so files into APK
-        env:
-          STOREPASS: ${{ secrets.ANDROID_KEYSTORE_PASS || 'debugpass' }}
-          KEYPASS:   ${{ secrets.ANDROID_KEY_PASS      || 'debugpass' }}
+      - name: Inject .so and sign APK
         run: |
           chmod +x android/inject_so.sh
-
           VERSION="${GITHUB_REF_NAME:-dev}"
-          OUT="TunSafe-Android-${VERSION}.apk"
-
           android/inject_so.sh \
             --apk       android/TunSafe-Android.apk \
-            --out       "$OUT" \
+            --out       "TunSafe-Android-${VERSION}.apk" \
             --libs      build/android/libs \
-            --keystore  ${{ steps.keystore.outputs.keystore }} \
-            --key-alias ${{ steps.keystore.outputs.alias }} \
-            --storepass "$STOREPASS" \
-            --keypass   "$KEYPASS"
+            --keystore  ${{ steps.ks.outputs.file }} \
+            --key-alias ${{ steps.ks.outputs.alias }} \
+            --storepass "${{ steps.ks.outputs.storepass }}" \
+            --keypass   "${{ steps.ks.outputs.keypass }}"
+          echo "APK_FILE=TunSafe-Android-${VERSION}.apk" >> $GITHUB_ENV
 
-          echo "APK_FILE=$OUT" >> $GITHUB_ENV
-          echo "SIGN_MODE=${{ steps.keystore.outputs.mode }}" >> $GITHUB_ENV
-
-      - name: Upload APK artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-android-apk
           path: ${{ env.APK_FILE }}
 
   # ─────────────────────────────────────────────────────────────────
-  # Release — publish to GitHub
+  # Release — публикация на GitHub
   # ─────────────────────────────────────────────────────────────────
   release:
     name: Publish GitHub Release
@@ -405,23 +421,23 @@ jobs:
           body: |
             ## TunSafe ${{ github.ref_name }}
 
-            > The Android APK is built from **this commit's C++ sources** — changes
-            > to `tunsafe_amalgam.cpp` and related files are reflected in the APK.
+            > Android APK собран из **исходников этого коммита** —
+            > изменения в `.cpp` файлах отражаются в APK автоматически.
 
-            ### Downloads
+            ### Загрузки
 
-            | Platform | Architecture | Notes |
-            |----------|-------------|-------|
-            | Linux | x86_64 | musl static + ASM |
-            | Linux | i686 | musl static |
-            | Linux | ARMv7 | musl static, NEON |
-            | Linux | AArch64/ARMv8 | musl static |
+            | Платформа | Архитектура | Примечание |
+            |-----------|-------------|-----------|
+            | Linux | x86_64 | musl static + ASM (ChaCha20/Poly1305/AES-GCM) |
+            | Linux | i686 | static |
+            | Linux | ARMv7 | static, NEON |
+            | Linux | AArch64/ARMv8 | static |
             | Windows | x86_64 GUI | MSVC Release |
             | Windows | x86_64 CLI | MinGW static |
             | Windows | i686 CLI | MinGW static |
-            | Android | arm64-v8a + armeabi-v7a + x86_64 | NDK-built .so injected into APK |
+            | Android | arm64-v8a + armeabi-v7a + x86_64 | NDK .so → APK |
 
-            Verify integrity with `SHA256SUMS.txt`.
+            Проверка целостности: `SHA256SUMS.txt`
           files: |
             artifacts/**/*
             SHA256SUMS.txt
