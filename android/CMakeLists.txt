@@ -7,10 +7,9 @@
 # benchmark.cpp and ts.cpp which are not Android-compatible.
 # Sources are listed explicitly below.
 #
-# The fix for "unknown type name 'WireguardProcessor'" (tunsafe_wg_plugin.h:39)
-# is -include wireguard.h — a compiler force-include that runs BEFORE each
-# translation unit, ensuring WireguardProcessor is always declared first.
-# This avoids modifying any header (which breaks the amalgam build).
+# NOTE: tunsafe_wg_plugin.h line 39 uses WireguardProcessor* but only includes
+# wireguard_proto.h (which doesn't define it). The patch-sources CI job adds
+# "class WireguardProcessor;" forward decl to the header via an idempotent sed.
 
 cmake_minimum_required(VERSION 3.22)
 project(tunsafe_native VERSION 1.0 LANGUAGES CXX C)
@@ -32,10 +31,6 @@ set(COMMON_FLAGS
     -Wno-unused-parameter
     -Wno-missing-field-initializers
     -Wno-unused-result
-    # Force-include wireguard.h before every TU so that WireguardProcessor
-    # is always declared before tunsafe_wg_plugin.h uses it (line 39).
-    # This is the correct fix — patching the .h breaks the amalgam build.
-    -include "${TUNSAFE_ROOT}/wireguard.h"
 )
 
 if(ANDROID_ABI STREQUAL "armeabi-v7a")
