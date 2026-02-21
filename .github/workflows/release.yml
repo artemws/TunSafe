@@ -332,15 +332,21 @@ jobs:
 
       - name: Fix libs directory layout
         run: |
+          # upload-artifact v4 preserves relative paths inside the artifact,
+          # so the download creates a nested structure like:
+          #   libs-raw/so-arm64-v8a/build/android/libs/arm64-v8a/libnative-lib.so
+          # Use find to locate files regardless of nesting depth.
           for abi in arm64-v8a armeabi-v7a x86_64; do
-            src="build/android/libs-raw/so-${abi}/libnative-lib.so"
-            dst="build/android/libs/${abi}/libnative-lib.so"
-            if [ -f "$src" ]; then
-              mkdir -p "$(dirname "$dst")"
-              mv "$src" "$dst"
-              echo "OK: $abi"
+            found=$(find build/android/libs-raw -path "*/${abi}/libnative-lib.so" | head -1)
+            if [ -n "$found" ]; then
+              mkdir -p "build/android/libs/${abi}"
+              mv "$found" "build/android/libs/${abi}/libnative-lib.so"
+              echo "OK: $abi -> build/android/libs/${abi}/libnative-lib.so"
+            else
+              echo "WARN: no .so found for $abi"
             fi
           done
+          echo "Final libs:"
           find build/android/libs -name "*.so" | sort
 
       - name: Install zipalign + apksigner
