@@ -120,10 +120,14 @@ jobs:
           path: tunsafe-linux-i686
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux ARMv7 — dockcross ($CXX устанавливается автоматически)
+  # Linux ARMv7 — apt cross-compiler (gnueabihf, hard-float)
+  # dockcross/linux-armv7 dropped: uses gnueabi (soft-float) and its static
+  # linker exits with error 127 on getaddrinfo. The Ubuntu apt toolchain
+  # (gnueabihf) is simpler, more reliable, and targets hard-float ABI
+  # which is correct for Raspberry Pi and most modern ARMv7 boards.
   # ─────────────────────────────────────────────────────────────────
   build-linux-armv7:
-    name: Linux ARMv7 (dockcross static)
+    name: Linux ARMv7 (static)
     runs-on: ubuntu-latest
     needs: patch-sources
     steps:
@@ -131,29 +135,22 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: patched-sources
-      - name: Setup dockcross armv7
+      - name: Install cross-compiler
         run: |
-          docker run --rm dockcross/linux-armv7 > ./dockcross-armv7
-          chmod +x ./dockcross-armv7
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf
       - name: Build TunSafe
         run: |
-          ./dockcross-armv7 bash -c "
-            set -e
-            echo 'CXX=' \$CXX
-            # dockcross/linux-armv7 uses gnueabi (soft-float ABI), NOT gnueabihf.
-            # -mfpu=neon and -march=armv7-a+fp are for hard-float toolchains and
-            # cause compilation failure here. Use plain -march=armv7-a instead.
-            \$CXX \
-              -I . -O2 -DNDEBUG \
-              -DWITH_NETWORK_BSD=1 \
-              -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
-              -march=armv7-a \
-              -std=gnu++14 -static -pthread \
-              -o tunsafe-linux-armv7 \
-              tunsafe_amalgam.cpp -lrt
-            \$STRIP tunsafe-linux-armv7
-            file tunsafe-linux-armv7
-          "
+          arm-linux-gnueabihf-g++ \
+            -I . -O2 -DNDEBUG \
+            -DWITH_NETWORK_BSD=1 \
+            -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
+            -mfpu=neon -march=armv7-a \
+            -std=gnu++14 -static -pthread \
+            -o tunsafe-linux-armv7 \
+            tunsafe_amalgam.cpp -lrt
+          arm-linux-gnueabihf-strip tunsafe-linux-armv7
+          file tunsafe-linux-armv7
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-armv7
