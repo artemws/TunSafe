@@ -1,11 +1,15 @@
 // network_android.cpp
 // Android WireGuard backend — mirrors TunsafeBackendBsdImpl from tunsafe_bsd.cpp.
 // Replaces open_tun() with the tun fd supplied by Android VpnService via JNI.
+//
+// NOTE: TunsafePlugin (2FA) is NOT used on Android — it requires CreateTunsafePlugin
+// from tunsafe_wg_plugin.cpp which has linking issues when built as a separate TU
+// via CMake/NDK.  The plugin slot is left nullptr; WireguardProcessor checks for
+// null before dereferencing, so this is safe.
 
 #include "build_config.h"
 #include "wireguard.h"
 #include "wireguard_config.h"
-#include "tunsafe_wg_plugin.h"
 #include "network_bsd.h"
 #include "network_common.h"
 #include "netapi.h"
@@ -37,11 +41,10 @@ class AndroidBackend
     : public TunInterface,
       public UdpInterface,
       public ProcessorDelegate,
-      public PluginDelegate,
       public NetworkBsd::NetworkBsdDelegate {
 public:
     AndroidBackend();
-    ~AndroidBackend();
+    ~AndroidBackend() {}
 
     bool Run(const char* config_str);
     void Stop();
@@ -58,15 +61,11 @@ public:
     void OnConnected() override;
     void OnConnectionRetry(uint32 attempts) override;
 
-    // PluginDelegate
-    void OnRequestToken(WgPeer* peer, uint32 type) override;
-
     // NetworkBsdDelegate
     void OnSecondLoop(uint64 now) override;
     void RunAllMainThreadScheduled() override;
 
 private:
-    TunsafePlugin*     plugin_;
     WireguardProcessor processor_;
     NetworkBsd         network_;
     TunSocketBsd       tun_;
@@ -74,21 +73,14 @@ private:
 };
 
 AndroidBackend::AndroidBackend()
-    : plugin_(nullptr),
-      processor_(this, this, this),   // UdpInterface, TunInterface, ProcessorDelegate
+    : processor_(this, this, this),   // UdpInterface, TunInterface, ProcessorDelegate
       network_(this, 1000),
       tun_(&network_, &processor_),
       udp_(&network_, &processor_) {
-    plugin_ = CreateTunsafePlugin(this, &processor_);
-    processor_.dev().SetPlugin(plugin_);
+    // Plugin (2FA) left as nullptr — safe, WireguardProcessor null-checks before use
+    processor_.dev().SetPlugin(nullptr);
 }
 
-AndroidBackend::~AndroidBackend() {
-    delete plugin_;
-}
-
-// TunInterface::Configure — called by WireguardProcessor when config is parsed.
-// We pass address/DNS/MTU info to Java so it can call VpnService.Builder.establish().
 bool AndroidBackend::Configure(const TunConfig&& config, TunConfigOut* out) {
     char buf[128];
     std::string tun_config;
@@ -149,10 +141,6 @@ void AndroidBackend::OnConnected() {
 void AndroidBackend::OnConnectionRetry(uint32 attempts) {
     LOGI("Retry (attempts=%u)", attempts);
     AndroidOnConnectionRetry((int)attempts);
-}
-
-void AndroidBackend::OnRequestToken(WgPeer* /*peer*/, uint32 /*type*/) {
-    // Token submission is handled via TunSafeSubmitToken → SubmitToken on plugin
 }
 
 void AndroidBackend::OnSecondLoop(uint64 /*now*/) {
