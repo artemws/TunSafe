@@ -1,173 +1,223 @@
 // network_android.cpp
-// Android platform backend for TunSafe.
-// Replaces tunsafe_bsd.cpp (which uses open_tun/GetDefaultRoute — Linux-only).
-//
-// The WireGuard engine from network_bsd.cpp handles all crypto and packet I/O.
-// This file wires it to Android's VpnService via the JNI callbacks.
+// Android WireGuard backend — mirrors TunsafeBackendBsdImpl from tunsafe_bsd.cpp.
+// Replaces open_tun() with the tun fd supplied by Android VpnService via JNI.
 
 #include "build_config.h"
-#include "tunsafe_types.h"
 #include "wireguard.h"
 #include "wireguard_config.h"
+#include "tunsafe_wg_plugin.h"
 #include "network_bsd.h"
+#include "network_common.h"
+#include "netapi.h"
+#include "tunsafe_ipaddr.h"
 #include "tunsafe_threading.h"
+#include "tunsafe_dnsresolve.h"
 #include "util.h"
 
 #include <android/log.h>
+#include <signal.h>
+#include <pthread.h>
 #include <string>
 #include <cstring>
-#include <cerrno>
+#include <cstdio>
 #include <unistd.h>
-#include <fcntl.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <pthread.h>
 
 #define LOG_TAG "TunSafeNet"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-// Declared in tunsafe_android.cpp — routes to Java callbacks
-extern int  AndroidConfigureTun(const char* config);
+// Declared in tunsafe_android.cpp
+extern int  AndroidConfigureTun(const char* config_str);
 extern void AndroidOnConnected();
 extern void AndroidOnConnectionRetry(int delay);
-extern void AndroidOnPingReply(const char* ip, int ms);
-extern void AndroidOnRequestToken(int type);
-extern void AndroidProtectFd(int fd);
-extern bool AndroidReleaseFd(int fd);
-extern void AndroidUpdateStats(int64_t rx, int64_t tx, int64_t conn_time_sec);
 
-// ── WireGuard engine state ────────────────────────────────────────────────────
+// ── Android backend ───────────────────────────────────────────────────────────
 
-static WireguardProcessor* g_wg = nullptr;
-static pthread_mutex_t     g_wg_mutex = PTHREAD_MUTEX_INITIALIZER;
-static volatile bool       g_stop_requested = false;
+class AndroidBackend
+    : public TunInterface,
+      public UdpInterface,
+      public ProcessorDelegate,
+      public PluginDelegate,
+      public NetworkBsd::NetworkBsdDelegate {
+public:
+    AndroidBackend();
+    ~AndroidBackend();
 
-// Current tun fd (provided by Android VpnService via configureTun callback)
-static int g_tun_fd = -1;
+    bool Run(const char* config_str);
+    void Stop();
 
-// ── Platform callbacks called by the BSD network engine ───────────────────────
-// network_bsd.cpp calls these when it needs platform services.
+    // TunInterface
+    bool Configure(const TunConfig&& config, TunConfigOut* out) override;
+    void WriteTunPacket(Packet* packet) override;
 
-// Called when the engine wants to open a tun interface.
-// On Android the tun fd comes from VpnService.Builder.establish() via Java;
-// we trigger that by calling AndroidConfigureTun with the WireGuard config.
-extern "C" int platform_open_tun(const char* config_str, int* out_fd) {
-    int fd = AndroidConfigureTun(config_str);
-    if (fd < 0) {
-        LOGE("platform_open_tun: AndroidConfigureTun returned %d", fd);
-        return -1;
+    // UdpInterface
+    bool Configure(int listen_port_udp, int listen_port_tcp) override;
+    void WriteUdpPacket(Packet* packet) override;
+
+    // ProcessorDelegate
+    void OnConnected() override;
+    void OnConnectionRetry(uint32 attempts) override;
+
+    // PluginDelegate
+    void OnRequestToken(WgPeer* peer, uint32 type) override;
+
+    // NetworkBsdDelegate
+    void OnSecondLoop(uint64 now) override;
+    void RunAllMainThreadScheduled() override;
+
+private:
+    TunsafePlugin*     plugin_;
+    WireguardProcessor processor_;
+    NetworkBsd         network_;
+    TunSocketBsd       tun_;
+    UdpSocketBsd       udp_;
+};
+
+AndroidBackend::AndroidBackend()
+    : plugin_(nullptr),
+      processor_(this, this, this),   // UdpInterface, TunInterface, ProcessorDelegate
+      network_(this, 1000),
+      tun_(&network_, &processor_),
+      udp_(&network_, &processor_) {
+    plugin_ = CreateTunsafePlugin(this, &processor_);
+    processor_.dev().SetPlugin(plugin_);
+}
+
+AndroidBackend::~AndroidBackend() {
+    delete plugin_;
+}
+
+// TunInterface::Configure — called by WireguardProcessor when config is parsed.
+// We pass address/DNS/MTU info to Java so it can call VpnService.Builder.establish().
+bool AndroidBackend::Configure(const TunConfig&& config, TunConfigOut* out) {
+    char buf[128];
+    std::string tun_config;
+
+    for (const auto& addr : config.addresses) {
+        if (addr.size == 4) {
+            snprintf(buf, sizeof(buf), "Address=%u.%u.%u.%u/%d\n",
+                     addr.addr[0], addr.addr[1], addr.addr[2], addr.addr[3], addr.cidr);
+            tun_config += buf;
+        }
     }
-    g_tun_fd = fd;
-    *out_fd = fd;
-    return 0;
+    for (const auto& dns : config.dns) {
+        if (dns.sin_family == AF_INET) {
+            const uint8_t* b = reinterpret_cast<const uint8_t*>(&dns.sin.sin_addr);
+            snprintf(buf, sizeof(buf), "DNS=%u.%u.%u.%u\n", b[0], b[1], b[2], b[3]);
+            tun_config += buf;
+        }
+    }
+    snprintf(buf, sizeof(buf), "MTU=%d\n", config.mtu > 0 ? config.mtu : 1420);
+    tun_config += buf;
+
+    if (out) {
+        out->enable_neighbor_discovery_spoofing = false;
+        memset(out->neighbor_discovery_spoofing_mac, 0, 6);
+    }
+
+    int tun_fd = AndroidConfigureTun(tun_config.c_str());
+    if (tun_fd < 0) {
+        LOGE("AndroidConfigureTun failed: %d", tun_fd);
+        return false;
+    }
+    if (!tun_.Initialize(tun_fd)) {
+        LOGE("TunSocketBsd::Initialize failed");
+        close(tun_fd);
+        return false;
+    }
+    LOGI("TUN fd=%d configured", tun_fd);
+    return true;
 }
 
-// Called when the engine opens a UDP/TCP socket — protect it from the VPN.
-extern "C" void platform_protect_fd(int fd) {
-    AndroidProtectFd(fd);
+void AndroidBackend::WriteTunPacket(Packet* packet) {
+    tun_.WritePacket(packet);
 }
 
-// Called when the engine is connected.
-extern "C" void platform_on_connected() {
-    LOGI("WireGuard connected");
+bool AndroidBackend::Configure(int listen_port_udp, int /*listen_port_tcp*/) {
+    return udp_.Initialize(listen_port_udp);
+}
+
+void AndroidBackend::WriteUdpPacket(Packet* packet) {
+    udp_.WritePacket(packet);
+}
+
+void AndroidBackend::OnConnected() {
+    LOGI("Connected");
     AndroidOnConnected();
 }
 
-// Called on connection retry.
-extern "C" void platform_on_connection_retry(int delay_sec) {
-    LOGI("WireGuard retry in %d s", delay_sec);
-    AndroidOnConnectionRetry(delay_sec);
+void AndroidBackend::OnConnectionRetry(uint32 attempts) {
+    LOGI("Retry (attempts=%u)", attempts);
+    AndroidOnConnectionRetry((int)attempts);
 }
 
-// Called with updated stats (bytes + uptime).
-extern "C" void platform_update_stats(int64_t rx, int64_t tx, int64_t conn_time_sec) {
-    AndroidUpdateStats(rx, tx, conn_time_sec);
+void AndroidBackend::OnRequestToken(WgPeer* /*peer*/, uint32 /*type*/) {
+    // Token submission is handled via TunSafeSubmitToken → SubmitToken on plugin
 }
 
-// ── Engine lifecycle ──────────────────────────────────────────────────────────
+void AndroidBackend::OnSecondLoop(uint64 /*now*/) {
+    processor_.SecondLoop();
+}
 
-static WireguardProcessor* CreateEngine(const char* config_str, bool kill_switch) {
-    WireguardProcessor* wg = new WireguardProcessor(nullptr, nullptr, nullptr);
-    if (!wg) return nullptr;
+void AndroidBackend::RunAllMainThreadScheduled() {
+    processor_.RunAllMainThreadScheduled();
+}
 
-    WgConfig cfg;
-    if (!ParseWireGuardConfiguration(&cfg, config_str)) {
+bool AndroidBackend::Run(const char* config_str) {
+    DnsResolver dns_resolver(nullptr);
+
+    if (!ParseWireGuardConfigString(&processor_, config_str, strlen(config_str), &dns_resolver)) {
         LOGE("Failed to parse WireGuard config");
-        delete wg;
-        return nullptr;
+        return false;
     }
-    (void)kill_switch; // TODO: implement kill-switch via VpnService setBlocking / Android firewall rules
-    wg->ConfigureWithConfig(cfg);
-    return wg;
+    if (!processor_.Start()) {
+        LOGE("WireguardProcessor::Start() failed");
+        return false;
+    }
+
+    sigset_t sigmask;
+    sigemptyset(&sigmask);
+    network_.RunLoop(&sigmask);
+    return true;
 }
 
-void WireGuardNetworkStart(const char* config, bool kill_switch) {
-    g_stop_requested = false;
+void AndroidBackend::Stop() {
+    *network_.exit_flag() = true;
+}
 
-    pthread_mutex_lock(&g_wg_mutex);
-    if (g_wg) { delete g_wg; g_wg = nullptr; }
-    g_wg = CreateEngine(config, kill_switch);
-    pthread_mutex_unlock(&g_wg_mutex);
+// ── Global singleton ──────────────────────────────────────────────────────────
 
-    if (!g_wg) { LOGE("Engine creation failed"); return; }
+static AndroidBackend* g_backend = nullptr;
+static pthread_mutex_t g_backend_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-    // Run the BSD event loop (polls tun + UDP sockets)
-    // network_bsd.cpp's RunLoop blocks until stopped.
-    extern void BsdNetworkRunLoop(WireguardProcessor* wg, volatile bool* stop);
-    BsdNetworkRunLoop(g_wg, &g_stop_requested);
+void WireGuardNetworkStart(const char* config, bool /*kill_switch*/) {
+    AndroidBackend* backend = new AndroidBackend();
 
-    pthread_mutex_lock(&g_wg_mutex);
-    delete g_wg;
-    g_wg = nullptr;
-    pthread_mutex_unlock(&g_wg_mutex);
+    pthread_mutex_lock(&g_backend_mutex);
+    if (g_backend) { delete g_backend; }
+    g_backend = backend;
+    pthread_mutex_unlock(&g_backend_mutex);
+
+    backend->Run(config);  // blocks until Stop()
+
+    pthread_mutex_lock(&g_backend_mutex);
+    if (g_backend == backend) g_backend = nullptr;
+    pthread_mutex_unlock(&g_backend_mutex);
+
+    delete backend;
 }
 
 void WireGuardNetworkStop() {
-    g_stop_requested = true;
-    // Wake up the event loop
-    pthread_mutex_lock(&g_wg_mutex);
-    if (g_wg) g_wg->WakeUp();
-    pthread_mutex_unlock(&g_wg_mutex);
+    pthread_mutex_lock(&g_backend_mutex);
+    AndroidBackend* b = g_backend;
+    pthread_mutex_unlock(&g_backend_mutex);
+    if (b) b->Stop();
 }
 
-bool WireGuardNetworkPing(const char* server) {
-    pthread_mutex_lock(&g_wg_mutex);
-    bool ok = g_wg && g_wg->SendPing(server);
-    pthread_mutex_unlock(&g_wg_mutex);
-    return ok;
-}
-
-bool WireGuardNetworkSetPingServer(const char* server) {
-    pthread_mutex_lock(&g_wg_mutex);
-    bool ok = g_wg && g_wg->SetPingServer(server);
-    pthread_mutex_unlock(&g_wg_mutex);
-    return ok;
-}
-
-void WireGuardNetworkRetryNow() {
-    pthread_mutex_lock(&g_wg_mutex);
-    if (g_wg) g_wg->RetryNow();
-    pthread_mutex_unlock(&g_wg_mutex);
-}
-
-void WireGuardNetworkSubmitToken(const char* token) {
-    pthread_mutex_lock(&g_wg_mutex);
-    if (g_wg) g_wg->SubmitToken(token);
-    pthread_mutex_unlock(&g_wg_mutex);
-}
-
-void WireGuardNetworkCloseFd(int fd) {
-    if (fd == g_tun_fd) g_tun_fd = -1;
-    close(fd);
-}
-
-void WireGuardNetworkPurgeFd(int fd) {
-    (void)fd; // fd will be recycled by the OS
-}
-
-void WireGuardNetworkPostExit(bool graceful) {
-    if (graceful) WireGuardNetworkStop();
-    else g_stop_requested = true;
-}
+void WireGuardNetworkRetryNow()                         { WireGuardNetworkStop(); }
+bool WireGuardNetworkPing(const char*)                  { return false; }
+bool WireGuardNetworkSetPingServer(const char*)         { return false; }
+void WireGuardNetworkSubmitToken(const char* /*token*/) {}
+void WireGuardNetworkCloseFd(int fd)                    { close(fd); }
+void WireGuardNetworkPurgeFd(int)                       {}
+void WireGuardNetworkPostExit(bool)                     { WireGuardNetworkStop(); }
