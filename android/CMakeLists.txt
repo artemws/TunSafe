@@ -3,13 +3,13 @@
 # Place at: <repo>/android/CMakeLists.txt
 # Source tree at:  <repo>/  (one level up)
 #
-# We do NOT use tunsafe_amalgam.cpp because it pulls in tunsafe_bsd.cpp,
-# benchmark.cpp and ts.cpp which are not Android-compatible.
-# Sources are listed explicitly below.
-#
-# NOTE: tunsafe_wg_plugin.h line 39 uses WireguardProcessor* but only includes
-# wireguard_proto.h (which doesn't define it). The patch-sources CI job adds
-# "class WireguardProcessor;" forward decl to the header via an idempotent sed.
+# tunsafe_wg_plugin.cpp is intentionally excluded:
+#   - It provides the 2FA TunsafePlugin, which is not used on Android.
+#   - CreateTunsafePlugin() caused persistent "undefined symbol" linker errors
+#     when tunsafe_wg_plugin.cpp was compiled as a separate TU via NDK/CMake
+#     (the file contains #pragma once and is designed for amalgam builds only).
+#   - WireguardProcessor::dev().SetPlugin(nullptr) is safe — all call sites
+#     in wireguard.cpp null-check before dereferencing the plugin pointer.
 
 cmake_minimum_required(VERSION 3.22)
 project(tunsafe_native VERSION 1.0 LANGUAGES CXX C)
@@ -39,15 +39,15 @@ endif()
 
 # ── Android-compatible WireGuard core sources ─────────────────────────────────
 # Equivalent to tunsafe_amalgam.cpp MINUS the non-Android files:
-#   - benchmark.cpp    (uses LARGE_INTEGER — Windows/Linux only)
-#   - tunsafe_bsd.cpp  (uses open_tun, GetDefaultRoute — no Android impl)
-#   - ts.cpp           (CLI main — not needed in .so)
+#   - tunsafe_wg_plugin.cpp  (2FA plugin — not needed on Android, linker issues)
+#   - benchmark.cpp          (uses LARGE_INTEGER — Windows/Linux only)
+#   - tunsafe_bsd.cpp        (uses open_tun, GetDefaultRoute — no Android impl)
+#   - ts.cpp                 (CLI main — not needed in .so)
 
 set(CORE_SOURCES
     "${TUNSAFE_ROOT}/wireguard.cpp"
     "${TUNSAFE_ROOT}/wireguard_proto.cpp"
     "${TUNSAFE_ROOT}/wireguard_config.cpp"
-    "${TUNSAFE_ROOT}/tunsafe_wg_plugin.cpp"
     "${TUNSAFE_ROOT}/util.cpp"
     "${TUNSAFE_ROOT}/tunsafe_threading.cpp"
     "${TUNSAFE_ROOT}/tunsafe_cpu.cpp"
