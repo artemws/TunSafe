@@ -323,31 +323,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download .so artifacts
+      # Download each ABI artifact directly into its final location.
+      # This avoids path-preservation issues with upload-artifact v4 that
+      # cause nested paths like so-arm64-v8a/build/android/libs/arm64-v8a/...
+      - name: Download arm64-v8a
         uses: actions/download-artifact@v4
         with:
-          pattern: so-*
-          path: build/android/libs-raw
-          merge-multiple: false
+          name: so-arm64-v8a
+          path: build/android/libs/arm64-v8a
 
-      - name: Fix libs directory layout
+      - name: Download armeabi-v7a
+        uses: actions/download-artifact@v4
+        with:
+          name: so-armeabi-v7a
+          path: build/android/libs/armeabi-v7a
+
+      - name: Download x86_64
+        uses: actions/download-artifact@v4
+        with:
+          name: so-x86_64
+          path: build/android/libs/x86_64
+
+      - name: Verify libs
         run: |
-          # upload-artifact v4 preserves relative paths inside the artifact,
-          # so the download creates a nested structure like:
-          #   libs-raw/so-arm64-v8a/build/android/libs/arm64-v8a/libnative-lib.so
-          # Use find to locate files regardless of nesting depth.
-          for abi in arm64-v8a armeabi-v7a x86_64; do
-            found=$(find build/android/libs-raw -path "*/${abi}/libnative-lib.so" | head -1)
-            if [ -n "$found" ]; then
-              mkdir -p "build/android/libs/${abi}"
-              mv "$found" "build/android/libs/${abi}/libnative-lib.so"
-              echo "OK: $abi -> build/android/libs/${abi}/libnative-lib.so"
-            else
-              echo "WARN: no .so found for $abi"
-            fi
-          done
-          echo "Final libs:"
+          echo "Libs:"
           find build/android/libs -name "*.so" | sort
+          find build/android/libs -name "*.so" | grep -q . || { echo "ERROR: no .so files found"; exit 1; }
 
       - name: Install zipalign + apksigner
         run: sudo apt-get update -q && sudo apt-get install -y zipalign apksigner
