@@ -7,31 +7,25 @@ on:
   workflow_dispatch:
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FIXES applied vs previous version:
+# CHANGES vs previous run:
 #
-# 1. Linux x86_64:   musl-clang не существует на ubuntu-latest —
-#                    заменено на clang++ с явным --sysroot к musl libc.
-#                    Если musl нет — fallback на g++ static.
+# FIX 1 - ARMv7: arm-linux-gnueabihf-g++ не найден в dockcross PATH →
+#          использовать $CXX (dockcross устанавливает эту переменную)
 #
-# 2. Linux AArch64 + ARMv7: ip_to_peer_map.cpp:109 — offsetof с VLA
-#                    не компилируется в gcc 10+. Патчим файл перед сборкой.
+# FIX 2 - Android: WireguardProcessor unknown →
+#          добавить forward decl в tunsafe_wg_plugin.h (патч в patch-sources)
 #
-# 3. Android NDK:    tunsafe_amalgam.cpp тянет tunsafe_bsd.cpp и benchmark.cpp
-#                    которые не компилируются под Android. CMakeLists теперь
-#                    компилирует только Android-совместимые файлы.
+# FIX 3 - Windows MSVC: Platform Toolset v141 не найден →
+#          добавить /p:PlatformToolset=v143
 #
-# 4. Windows MSVC:   SDK 10.0.17763.0 не установлен на windows-latest.
-#                    Добавлен /p:WindowsTargetPlatformVersion=10.0 (latest).
-#
-# 5. Windows MinGW:  WIN32 network backend не портирован на MinGW —
-#                    job помечен как allow-failure (continue-on-error).
+# FIX 4 - Windows MinGW: Ws2tcpip.h не найден (case-sensitive Linux) →
+#          перенести job на windows-latest, использовать choco mingw
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
 
   # ─────────────────────────────────────────────────────────────────
-  # Патч ip_to_peer_map.cpp один раз, переиспользуем в остальных job'ах
-  # через кэш.
+  # Патчим исходники один раз — все остальные job'ы скачивают патч
   # ─────────────────────────────────────────────────────────────────
   patch-sources:
     name: Patch sources
@@ -39,15 +33,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # FIX #2: offsetof(Node, child[bits]) — VLA в offsetof не работает в gcc 10+
-      # Заменяем на: offsetof(Node, child) + N*sizeof(Node*)
+      # FIX: offsetof с VLA (GCC 10+)
       - name: Patch ip_to_peer_map.cpp
         run: |
           sed -i \
             's/malloc(offsetof(RoutingTrie32::Node, child\[(uint32)(1U << bits)\]))/malloc(offsetof(RoutingTrie32::Node, child) + ((size_t)(1U << bits)) * sizeof(RoutingTrie32::Node*))/' \
             ip_to_peer_map.cpp
-          echo "Patched line:"
           grep -n "malloc(offsetof" ip_to_peer_map.cpp
+
+      # FIX: WireguardProcessor forward decl отсутствует в tunsafe_wg_plugin.h
+      # Это вызывает ошибку при раздельной компиляции (Android NDK)
+      - name: Patch tunsafe_wg_plugin.h
+        run: |
+          sed -i \
+            's|#include "wireguard_proto.h"|#include "wireguard_proto.h"\n\n// Forward declaration (full definition in wireguard.h)\nclass WireguardProcessor;|' \
+            tunsafe_wg_plugin.h
+          grep -n "WireguardProcessor" tunsafe_wg_plugin.h | head -3
 
       - name: Upload patched sources
         uses: actions/upload-artifact@v4
@@ -55,10 +56,10 @@ jobs:
           name: patched-sources
           path: |
             ip_to_peer_map.cpp
+            tunsafe_wg_plugin.h
 
   # ─────────────────────────────────────────────────────────────────
   # Linux x86_64 — static + ASM
-  # FIX #1: не используем musl-clang (недоступен), используем g++ -static
   # ─────────────────────────────────────────────────────────────────
   build-linux-x86_64:
     name: Linux x86_64 (static + ASM)
@@ -66,28 +67,22 @@ jobs:
     needs: patch-sources
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download patched sources
+      - name: Apply patches
         uses: actions/download-artifact@v4
         with:
           name: patched-sources
-
       - name: Install dependencies
         run: sudo apt-get update -q && sudo apt-get install -y gcc g++ binutils
-
       - name: Build ASM objects
         run: |
-          # ASM нужен clang для -march=skylake-avx512, gcc тоже справится
           gcc -c -march=skylake-avx512 \
             crypto/poly1305/poly1305-x64-linux.s \
             crypto/chacha20/chacha20-x64-linux.s
-
       - name: Build TunSafe
         run: |
           g++ -I . -O3 -DNDEBUG \
             -DWITH_NETWORK_BSD=1 \
-            -mssse3 \
-            -std=gnu++14 \
+            -mssse3 -std=gnu++14 \
             -static -pthread \
             -o tunsafe-linux-x86_64 \
             tunsafe_amalgam.cpp \
@@ -99,7 +94,6 @@ jobs:
             -lrt
           strip tunsafe-linux-x86_64
           file tunsafe-linux-x86_64
-
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-x86_64
@@ -114,40 +108,35 @@ jobs:
     needs: patch-sources
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download patched sources
+      - name: Apply patches
         uses: actions/download-artifact@v4
         with:
           name: patched-sources
-
       - name: Install dependencies
         run: |
           sudo apt-get update -q
           sudo apt-get install -y gcc-multilib g++-multilib
-
       - name: Build TunSafe
         run: |
           g++ -m32 -I . -O3 -DNDEBUG \
             -DWITH_NETWORK_BSD=1 \
-            -DCHACHA20_WITH_ASM=0 \
-            -DBLAKE2S_WITH_ASM=0 \
-            -mssse3 \
-            -std=gnu++14 \
+            -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
+            -mssse3 -std=gnu++14 \
             -static -pthread \
             -o tunsafe-linux-i686 \
             tunsafe_amalgam.cpp \
             -lrt
           strip tunsafe-linux-i686
           file tunsafe-linux-i686
-
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-i686
           path: tunsafe-linux-i686
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux ARMv7 — dockcross static
-  # FIX #2: патч применяется к исходникам перед сборкой
+  # Linux ARMv7 — dockcross
+  # FIX 1: использовать $CXX вместо arm-linux-gnueabihf-g++
+  # dockcross устанавливает CXX=arm-linux-gnueabihf-g++ в окружение контейнера
   # ─────────────────────────────────────────────────────────────────
   build-linux-armv7:
     name: Linux ARMv7 (dockcross static)
@@ -155,44 +144,40 @@ jobs:
     needs: patch-sources
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download patched sources
+      - name: Apply patches
         uses: actions/download-artifact@v4
         with:
           name: patched-sources
-
       - name: Setup dockcross armv7
         run: |
           docker run --rm dockcross/linux-armv7 > ./dockcross-armv7
           chmod +x ./dockcross-armv7
-
       - name: Build TunSafe
         run: |
+          # dockcross экспортирует $CXX = правильный кросс-компилятор
           ./dockcross-armv7 bash -c "
             set -e
-            arm-linux-gnueabihf-g++ \
+            echo 'Compiler: '\$CXX
+            \$CXX \
               -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
-              -DCHACHA20_WITH_ASM=0 \
-              -DBLAKE2S_WITH_ASM=0 \
+              -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
               -mfpu=neon -march=armv7-a+fp \
               -std=gnu++14 \
               -static -pthread \
               -o tunsafe-linux-armv7 \
               tunsafe_amalgam.cpp \
               -lrt
-            arm-linux-gnueabihf-strip tunsafe-linux-armv7
+            \$STRIP tunsafe-linux-armv7
             file tunsafe-linux-armv7
           "
-
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-armv7
           path: tunsafe-linux-armv7
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux AArch64 — dockcross static
-  # FIX #2: патч применяется к исходникам перед сборкой
+  # Linux AArch64 — dockcross
   # ─────────────────────────────────────────────────────────────────
   build-linux-aarch64:
     name: Linux AArch64/ARMv8 (dockcross static)
@@ -200,35 +185,31 @@ jobs:
     needs: patch-sources
     steps:
       - uses: actions/checkout@v4
-
-      - name: Download patched sources
+      - name: Apply patches
         uses: actions/download-artifact@v4
         with:
           name: patched-sources
-
       - name: Setup dockcross aarch64
         run: |
           docker run --rm dockcross/linux-arm64 > ./dockcross-aarch64
           chmod +x ./dockcross-aarch64
-
       - name: Build TunSafe
         run: |
           ./dockcross-aarch64 bash -c "
             set -e
-            aarch64-unknown-linux-gnu-g++ \
+            echo 'Compiler: '\$CXX
+            \$CXX \
               -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
-              -DCHACHA20_WITH_ASM=0 \
-              -DBLAKE2S_WITH_ASM=0 \
+              -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
               -std=gnu++14 \
               -static -pthread \
               -o tunsafe-linux-aarch64 \
               tunsafe_amalgam.cpp \
               -lrt
-            aarch64-unknown-linux-gnu-strip tunsafe-linux-aarch64
+            \$STRIP tunsafe-linux-aarch64
             file tunsafe-linux-aarch64
           "
-
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-aarch64
@@ -236,8 +217,7 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────
   # Windows MSVC — GUI
-  # FIX #4: добавлен WindowsTargetPlatformVersion=10.0 (использует
-  #          последнюю установленную версию SDK вместо 10.0.17763.0)
+  # FIX 3: добавлен PlatformToolset=v143 (VS2022 — то что установлено)
   # ─────────────────────────────────────────────────────────────────
   build-windows-msvc:
     name: Windows MSVC x64 (GUI)
@@ -251,6 +231,7 @@ jobs:
             /p:Configuration=Release `
             /p:Platform=x64 `
             /p:WindowsTargetPlatformVersion=10.0 `
+            /p:PlatformToolset=v143 `
             /m /nologo
       - name: Collect artifacts
         shell: pwsh
@@ -267,37 +248,44 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────
   # Windows MinGW — CLI static
-  # FIX #5: continue-on-error=true, WIN32 backend требует портирования
+  # FIX 4: перенесён на windows-latest где MinGW заголовки имеют
+  #         правильный регистр (Ws2tcpip.h, Windows.h и т.д.)
   # ─────────────────────────────────────────────────────────────────
   build-windows-mingw:
     name: Windows MinGW static (${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     continue-on-error: true
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: x86_64
-            triple: x86_64-w64-mingw32
+            flags: ""
           - arch: i686
-            triple: i686-w64-mingw32
+            flags: "-m32"
     steps:
       - uses: actions/checkout@v4
-      - name: Install MinGW
-        run: sudo apt-get update -q && sudo apt-get install -y mingw-w64
-      - name: Build
+      - name: Install MinGW via chocolatey
+        shell: pwsh
         run: |
-          ${{ matrix.triple }}-g++ \
+          choco install mingw --no-progress -y
+          # Refresh PATH
+          $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH','User')
+          g++ --version
+      - name: Build TunSafe
+        shell: bash
+        run: |
+          export PATH="/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin:$PATH"
+          g++ \
+            ${{ matrix.flags }} \
             -I . -O3 -DNDEBUG \
             -DWITH_NETWORK_WIN32=1 \
-            -DCHACHA20_WITH_ASM=0 \
-            -DBLAKE2S_WITH_ASM=0 \
-            -std=gnu++14 \
-            -static \
+            -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
+            -std=gnu++14 -static \
             -o tunsafe-windows-${{ matrix.arch }}.exe \
             tunsafe_amalgam.cpp \
             -lws2_32 -liphlpapi -lwinmm
-          ${{ matrix.triple }}-strip tunsafe-windows-${{ matrix.arch }}.exe
+          strip tunsafe-windows-${{ matrix.arch }}.exe
       - uses: actions/upload-artifact@v4
         if: success()
         with:
@@ -306,12 +294,12 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────
   # Android NDK — сборка libnative-lib.so
-  # FIX #3: CMakeLists компилирует только Android-совместимые файлы
-  #         (без tunsafe_bsd.cpp, benchmark.cpp, ts.cpp)
+  # FIX 2: tunsafe_wg_plugin.h патчится в patch-sources
   # ─────────────────────────────────────────────────────────────────
   build-android:
     name: Android NDK (${{ matrix.abi }})
     runs-on: ubuntu-latest
+    needs: patch-sources
     strategy:
       fail-fast: false
       matrix:
@@ -324,6 +312,11 @@ jobs:
             api: 21
     steps:
       - uses: actions/checkout@v4
+
+      - name: Apply patches
+        uses: actions/download-artifact@v4
+        with:
+          name: patched-sources
 
       - name: Setup NDK r26d
         id: setup-ndk
@@ -374,15 +367,13 @@ jobs:
 
       - name: Fix libs directory layout
         run: |
-          # download-artifact создаёт build/android/libs-raw/so-arm64-v8a/libnative-lib.so
-          # inject_so.sh ожидает build/android/libs/arm64-v8a/libnative-lib.so
           for abi in arm64-v8a armeabi-v7a x86_64; do
             src="build/android/libs-raw/so-${abi}/libnative-lib.so"
             dst="build/android/libs/${abi}/libnative-lib.so"
             if [ -f "$src" ]; then
               mkdir -p "$(dirname "$dst")"
               mv "$src" "$dst"
-              echo "Moved: $abi"
+              echo "OK: $abi"
             fi
           done
           find build/android/libs -name "*.so" | sort
@@ -395,10 +386,10 @@ jobs:
         run: |
           if [ -n "${{ secrets.ANDROID_KEYSTORE_B64 }}" ]; then
             echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > signing.keystore
-            echo "file=signing.keystore"                               >> $GITHUB_OUTPUT
-            echo "alias=${{ secrets.ANDROID_KEY_ALIAS }}"             >> $GITHUB_OUTPUT
-            echo "storepass=${{ secrets.ANDROID_KEYSTORE_PASS }}"     >> $GITHUB_OUTPUT
-            echo "keypass=${{ secrets.ANDROID_KEY_PASS }}"            >> $GITHUB_OUTPUT
+            echo "file=signing.keystore"                           >> $GITHUB_OUTPUT
+            echo "alias=${{ secrets.ANDROID_KEY_ALIAS }}"         >> $GITHUB_OUTPUT
+            echo "storepass=${{ secrets.ANDROID_KEYSTORE_PASS }}" >> $GITHUB_OUTPUT
+            echo "keypass=${{ secrets.ANDROID_KEY_PASS }}"        >> $GITHUB_OUTPUT
           else
             keytool -genkeypair -keystore debug.keystore -alias tunsafe \
               -keyalg RSA -keysize 2048 -validity 3650 \
@@ -413,7 +404,7 @@ jobs:
       - name: Check APK
         run: |
           [ -f android/TunSafe-Android.apk ] || {
-            echo "::error::android/TunSafe-Android.apk not found. Commit the APK to android/ directory."
+            echo "::error::android/TunSafe-Android.apk not found"
             exit 1
           }
 
@@ -490,8 +481,8 @@ jobs:
             | Linux | i686 | static |
             | Linux | ARMv7 | static, NEON |
             | Linux | AArch64 | static |
-            | Windows | x86_64 GUI | MSVC Release |
-            | Android | arm64-v8a + armeabi-v7a + x86_64 | NDK |
+            | Windows | x86_64 GUI | MSVC v143 |
+            | Android | arm64-v8a + armeabi-v7a + x86_64 | NDK r26d |
 
             Проверка целостности: `SHA256SUMS.txt`
           files: |
