@@ -10,23 +10,25 @@ on:
 # CHANGES vs previous run:
 #
 # FIX - Android linker "undefined symbol: CreateTunsafePlugin":
-#   Caused by -include wireguard.h in CMakeLists — clang processed wireguard.h
-#   as a force-include in tunsafe_wg_plugin.cpp's TU, which triggered
-#   a #pragma once guard on the second #include "wireguard.h" inside that file.
-#   This caused the linker to not see the symbol in some NDK versions.
+#   Root cause: tunsafe_wg_plugin.cpp is designed for amalgam-only builds
+#   (it contains #pragma once and is meant to be #include'd, not compiled as
+#   a standalone TU). When compiled separately by NDK/CMake, the symbol
+#   CreateTunsafePlugin was not consistently visible to the linker.
 #
 #   CORRECT FIX:
-#   1. Remove -include from CMakeLists entirely.
-#   2. Add idempotent forward decl patch to tunsafe_wg_plugin.h in patch-sources.
-#      Uses "grep -q" to check before patching — safe to run multiple times.
-#      A bare forward decl "class WireguardProcessor;" is valid C++ regardless
-#      of how many times it appears, and does NOT break the amalgam build.
+#   - Remove tunsafe_wg_plugin.cpp from CMakeLists CORE_SOURCES entirely.
+#   - Remove the PluginDelegate inheritance from AndroidBackend.
+#   - Pass nullptr to processor_.dev().SetPlugin() — safe because
+#     WireguardProcessor null-checks before using the plugin pointer.
+#   - No more patching of tunsafe_wg_plugin.h needed.
+#
+# patch-sources now only patches ip_to_peer_map.cpp (offsetof VLA fix).
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
 
   # ─────────────────────────────────────────────────────────────────
-  # Патч исходников — применяется один раз, все job'ы скачивают результат
+  # Патч ip_to_peer_map.cpp — offsetof с VLA не работает в GCC 10+
   # ─────────────────────────────────────────────────────────────────
   patch-sources:
     name: Patch sources
@@ -34,7 +36,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # FIX 1: offsetof(Node, child[bits]) — VLA в offsetof не работает в GCC 10+
       - name: Patch ip_to_peer_map.cpp (offsetof VLA)
         run: |
           sed -i \
@@ -42,27 +43,10 @@ jobs:
             ip_to_peer_map.cpp
           grep -n "malloc(offsetof" ip_to_peer_map.cpp
 
-      # FIX 2: tunsafe_wg_plugin.h:39 использует WireguardProcessor* без forward decl.
-      # Патч IDEMPOTENT: grep -q проверяет наличие перед применением.
-      # Безопасно для amalgam — forward decl допустим много раз в C++.
-      - name: Patch tunsafe_wg_plugin.h (WireguardProcessor forward decl)
-        run: |
-          if grep -q "class WireguardProcessor;" tunsafe_wg_plugin.h; then
-            echo "tunsafe_wg_plugin.h already patched, skipping"
-          else
-            sed -i \
-              's|#include "wireguard_proto.h"|#include "wireguard_proto.h"\nclass WireguardProcessor;|' \
-              tunsafe_wg_plugin.h
-            echo "Patched tunsafe_wg_plugin.h:"
-            head -5 tunsafe_wg_plugin.h
-          fi
-
       - uses: actions/upload-artifact@v4
         with:
           name: patched-sources
-          path: |
-            ip_to_peer_map.cpp
-            tunsafe_wg_plugin.h
+          path: ip_to_peer_map.cpp
 
   # ─────────────────────────────────────────────────────────────────
   # Linux x86_64 — static + ASM
@@ -209,7 +193,7 @@ jobs:
           path: tunsafe-linux-aarch64
 
   # ─────────────────────────────────────────────────────────────────
-  # Windows MSVC — GUI (PlatformToolset=v143, WindowsTargetPlatformVersion=10.0)
+  # Windows MSVC — GUI
   # ─────────────────────────────────────────────────────────────────
   build-windows-msvc:
     name: Windows MSVC x64 (GUI)
@@ -239,7 +223,7 @@ jobs:
           path: dist\
 
   # ─────────────────────────────────────────────────────────────────
-  # Windows MinGW — CLI static (на windows-latest для правильных заголовков)
+  # Windows MinGW — CLI static (на windows-latest)
   # ─────────────────────────────────────────────────────────────────
   build-windows-mingw:
     name: Windows MinGW static (${{ matrix.arch }})
