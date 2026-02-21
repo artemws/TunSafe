@@ -9,20 +9,24 @@ on:
 # ─────────────────────────────────────────────────────────────────────────────
 # CHANGES vs previous run:
 #
-# FIX - Android "WireguardProcessor unknown":
-#   REMOVED the sed patch to tunsafe_wg_plugin.h — it caused enum redefinition
-#   errors in the amalgam build on subsequent CI runs (sed applied twice).
-#   CORRECT FIX: CMakeLists.txt uses -include wireguard.h (force-include)
-#   so WireguardProcessor is always declared before tunsafe_wg_plugin.h.
-#   No source files are modified.
+# FIX - Android linker "undefined symbol: CreateTunsafePlugin":
+#   Caused by -include wireguard.h in CMakeLists — clang processed wireguard.h
+#   as a force-include in tunsafe_wg_plugin.cpp's TU, which triggered
+#   a #pragma once guard on the second #include "wireguard.h" inside that file.
+#   This caused the linker to not see the symbol in some NDK versions.
 #
-# patch-sources job now only patches ip_to_peer_map.cpp (offsetof VLA fix).
+#   CORRECT FIX:
+#   1. Remove -include from CMakeLists entirely.
+#   2. Add idempotent forward decl patch to tunsafe_wg_plugin.h in patch-sources.
+#      Uses "grep -q" to check before patching — safe to run multiple times.
+#      A bare forward decl "class WireguardProcessor;" is valid C++ regardless
+#      of how many times it appears, and does NOT break the amalgam build.
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
 
   # ─────────────────────────────────────────────────────────────────
-  # Патч ip_to_peer_map.cpp — offsetof с VLA не работает в GCC 10+
+  # Патч исходников — применяется один раз, все job'ы скачивают результат
   # ─────────────────────────────────────────────────────────────────
   patch-sources:
     name: Patch sources
@@ -30,18 +34,35 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Patch ip_to_peer_map.cpp (offsetof VLA fix)
+      # FIX 1: offsetof(Node, child[bits]) — VLA в offsetof не работает в GCC 10+
+      - name: Patch ip_to_peer_map.cpp (offsetof VLA)
         run: |
           sed -i \
             's/malloc(offsetof(RoutingTrie32::Node, child\[(uint32)(1U << bits)\]))/malloc(offsetof(RoutingTrie32::Node, child) + ((size_t)(1U << bits)) * sizeof(RoutingTrie32::Node*))/' \
             ip_to_peer_map.cpp
-          echo "Patched:"
           grep -n "malloc(offsetof" ip_to_peer_map.cpp
+
+      # FIX 2: tunsafe_wg_plugin.h:39 использует WireguardProcessor* без forward decl.
+      # Патч IDEMPOTENT: grep -q проверяет наличие перед применением.
+      # Безопасно для amalgam — forward decl допустим много раз в C++.
+      - name: Patch tunsafe_wg_plugin.h (WireguardProcessor forward decl)
+        run: |
+          if grep -q "class WireguardProcessor;" tunsafe_wg_plugin.h; then
+            echo "tunsafe_wg_plugin.h already patched, skipping"
+          else
+            sed -i \
+              's|#include "wireguard_proto.h"|#include "wireguard_proto.h"\nclass WireguardProcessor;|' \
+              tunsafe_wg_plugin.h
+            echo "Patched tunsafe_wg_plugin.h:"
+            head -5 tunsafe_wg_plugin.h
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
           name: patched-sources
-          path: ip_to_peer_map.cpp
+          path: |
+            ip_to_peer_map.cpp
+            tunsafe_wg_plugin.h
 
   # ─────────────────────────────────────────────────────────────────
   # Linux x86_64 — static + ASM
@@ -64,7 +85,7 @@ jobs:
             crypto/chacha20/chacha20-x64-linux.s
       - name: Build TunSafe
         run: |
-          g++ -I . -O3 -DNDEBUG -DNO_PLUGIN \
+          g++ -I . -O3 -DNDEBUG \
             -DWITH_NETWORK_BSD=1 \
             -mssse3 -std=gnu++14 \
             -static -pthread \
@@ -99,7 +120,7 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y gcc-multilib g++-multilib
       - name: Build TunSafe
         run: |
-          g++ -m32 -I . -O3 -DNDEBUG -DNO_PLUGIN \
+          g++ -m32 -I . -O3 -DNDEBUG \
             -DWITH_NETWORK_BSD=1 \
             -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
             -mssse3 -std=gnu++14 \
@@ -115,8 +136,7 @@ jobs:
           path: tunsafe-linux-i686
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux ARMv7 — dockcross
-  # FIX: используем $CXX и $STRIP (устанавливаются dockcross автоматически)
+  # Linux ARMv7 — dockcross ($CXX устанавливается автоматически)
   # ─────────────────────────────────────────────────────────────────
   build-linux-armv7:
     name: Linux ARMv7 (dockcross static)
@@ -137,13 +157,13 @@ jobs:
             set -e
             echo 'CXX=' \$CXX
             \$CXX \
-              -I . -O2 -DNDEBUG -DNO_PLUGIN \
+              -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
               -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
               -mfpu=neon -march=armv7-a+fp \
               -std=gnu++14 -static -pthread \
               -o tunsafe-linux-armv7 \
-              tunsafe_amalgam.cpp -lrt \
+              tunsafe_amalgam.cpp -lrt
             \$STRIP tunsafe-linux-armv7
             file tunsafe-linux-armv7
           "
@@ -174,12 +194,12 @@ jobs:
             set -e
             echo 'CXX=' \$CXX
             \$CXX \
-              -I . -O2 -DNDEBUG -DNO_PLUGIN \
+              -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
               -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
               -std=gnu++14 -static -pthread \
               -o tunsafe-linux-aarch64 \
-              tunsafe_amalgam.cpp -lrt \
+              tunsafe_amalgam.cpp -lrt
             \$STRIP tunsafe-linux-aarch64
             file tunsafe-linux-aarch64
           "
@@ -189,8 +209,7 @@ jobs:
           path: tunsafe-linux-aarch64
 
   # ─────────────────────────────────────────────────────────────────
-  # Windows MSVC — GUI
-  # FIX: PlatformToolset=v143 (VS2022), WindowsTargetPlatformVersion=10.0
+  # Windows MSVC — GUI (PlatformToolset=v143, WindowsTargetPlatformVersion=10.0)
   # ─────────────────────────────────────────────────────────────────
   build-windows-msvc:
     name: Windows MSVC x64 (GUI)
@@ -220,8 +239,7 @@ jobs:
           path: dist\
 
   # ─────────────────────────────────────────────────────────────────
-  # Windows MinGW — CLI static
-  # FIX: runs on windows-latest (case-sensitive headers Ws2tcpip.h etc.)
+  # Windows MinGW — CLI static (на windows-latest для правильных заголовков)
   # ─────────────────────────────────────────────────────────────────
   build-windows-mingw:
     name: Windows MinGW static (${{ matrix.arch }})
@@ -262,8 +280,6 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────
   # Android NDK — сборка libnative-lib.so
-  # FIX: CMakeLists использует -include wireguard.h (force-include)
-  #      вместо патча tunsafe_wg_plugin.h
   # ─────────────────────────────────────────────────────────────────
   build-android:
     name: Android NDK (${{ matrix.abi }})
@@ -276,7 +292,7 @@ jobs:
           - abi: arm64-v8a
             api: 21
           - abi: armeabi-v7a
-            api: 19
+            api: 21
           - abi: x86_64
             api: 21
     steps:
