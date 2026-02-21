@@ -9,23 +9,20 @@ on:
 # ─────────────────────────────────────────────────────────────────────────────
 # CHANGES vs previous run:
 #
-# FIX 1 - ARMv7: arm-linux-gnueabihf-g++ не найден в dockcross PATH →
-#          использовать $CXX (dockcross устанавливает эту переменную)
+# FIX - Android "WireguardProcessor unknown":
+#   REMOVED the sed patch to tunsafe_wg_plugin.h — it caused enum redefinition
+#   errors in the amalgam build on subsequent CI runs (sed applied twice).
+#   CORRECT FIX: CMakeLists.txt uses -include wireguard.h (force-include)
+#   so WireguardProcessor is always declared before tunsafe_wg_plugin.h.
+#   No source files are modified.
 #
-# FIX 2 - Android: WireguardProcessor unknown →
-#          добавить forward decl в tunsafe_wg_plugin.h (патч в patch-sources)
-#
-# FIX 3 - Windows MSVC: Platform Toolset v141 не найден →
-#          добавить /p:PlatformToolset=v143
-#
-# FIX 4 - Windows MinGW: Ws2tcpip.h не найден (case-sensitive Linux) →
-#          перенести job на windows-latest, использовать choco mingw
+# patch-sources job now only patches ip_to_peer_map.cpp (offsetof VLA fix).
 # ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
 
   # ─────────────────────────────────────────────────────────────────
-  # Патчим исходники один раз — все остальные job'ы скачивают патч
+  # Патч ip_to_peer_map.cpp — offsetof с VLA не работает в GCC 10+
   # ─────────────────────────────────────────────────────────────────
   patch-sources:
     name: Patch sources
@@ -33,30 +30,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # FIX: offsetof с VLA (GCC 10+)
-      - name: Patch ip_to_peer_map.cpp
+      - name: Patch ip_to_peer_map.cpp (offsetof VLA fix)
         run: |
           sed -i \
             's/malloc(offsetof(RoutingTrie32::Node, child\[(uint32)(1U << bits)\]))/malloc(offsetof(RoutingTrie32::Node, child) + ((size_t)(1U << bits)) * sizeof(RoutingTrie32::Node*))/' \
             ip_to_peer_map.cpp
+          echo "Patched:"
           grep -n "malloc(offsetof" ip_to_peer_map.cpp
 
-      # FIX: WireguardProcessor forward decl отсутствует в tunsafe_wg_plugin.h
-      # Это вызывает ошибку при раздельной компиляции (Android NDK)
-      - name: Patch tunsafe_wg_plugin.h
-        run: |
-          sed -i \
-            's|#include "wireguard_proto.h"|#include "wireguard_proto.h"\n\n// Forward declaration (full definition in wireguard.h)\nclass WireguardProcessor;|' \
-            tunsafe_wg_plugin.h
-          grep -n "WireguardProcessor" tunsafe_wg_plugin.h | head -3
-
-      - name: Upload patched sources
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: patched-sources
-          path: |
-            ip_to_peer_map.cpp
-            tunsafe_wg_plugin.h
+          path: ip_to_peer_map.cpp
 
   # ─────────────────────────────────────────────────────────────────
   # Linux x86_64 — static + ASM
@@ -67,8 +52,7 @@ jobs:
     needs: patch-sources
     steps:
       - uses: actions/checkout@v4
-      - name: Apply patches
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: patched-sources
       - name: Install dependencies
@@ -108,14 +92,11 @@ jobs:
     needs: patch-sources
     steps:
       - uses: actions/checkout@v4
-      - name: Apply patches
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: patched-sources
       - name: Install dependencies
-        run: |
-          sudo apt-get update -q
-          sudo apt-get install -y gcc-multilib g++-multilib
+        run: sudo apt-get update -q && sudo apt-get install -y gcc-multilib g++-multilib
       - name: Build TunSafe
         run: |
           g++ -m32 -I . -O3 -DNDEBUG \
@@ -135,8 +116,7 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────
   # Linux ARMv7 — dockcross
-  # FIX 1: использовать $CXX вместо arm-linux-gnueabihf-g++
-  # dockcross устанавливает CXX=arm-linux-gnueabihf-g++ в окружение контейнера
+  # FIX: используем $CXX и $STRIP (устанавливаются dockcross автоматически)
   # ─────────────────────────────────────────────────────────────────
   build-linux-armv7:
     name: Linux ARMv7 (dockcross static)
@@ -144,8 +124,7 @@ jobs:
     needs: patch-sources
     steps:
       - uses: actions/checkout@v4
-      - name: Apply patches
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: patched-sources
       - name: Setup dockcross armv7
@@ -154,20 +133,17 @@ jobs:
           chmod +x ./dockcross-armv7
       - name: Build TunSafe
         run: |
-          # dockcross экспортирует $CXX = правильный кросс-компилятор
           ./dockcross-armv7 bash -c "
             set -e
-            echo 'Compiler: '\$CXX
+            echo 'CXX=' \$CXX
             \$CXX \
               -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
               -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
               -mfpu=neon -march=armv7-a+fp \
-              -std=gnu++14 \
-              -static -pthread \
+              -std=gnu++14 -static -pthread \
               -o tunsafe-linux-armv7 \
-              tunsafe_amalgam.cpp \
-              -lrt
+              tunsafe_amalgam.cpp -lrt
             \$STRIP tunsafe-linux-armv7
             file tunsafe-linux-armv7
           "
@@ -185,8 +161,7 @@ jobs:
     needs: patch-sources
     steps:
       - uses: actions/checkout@v4
-      - name: Apply patches
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: patched-sources
       - name: Setup dockcross aarch64
@@ -197,16 +172,14 @@ jobs:
         run: |
           ./dockcross-aarch64 bash -c "
             set -e
-            echo 'Compiler: '\$CXX
+            echo 'CXX=' \$CXX
             \$CXX \
               -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
               -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
-              -std=gnu++14 \
-              -static -pthread \
+              -std=gnu++14 -static -pthread \
               -o tunsafe-linux-aarch64 \
-              tunsafe_amalgam.cpp \
-              -lrt
+              tunsafe_amalgam.cpp -lrt
             \$STRIP tunsafe-linux-aarch64
             file tunsafe-linux-aarch64
           "
@@ -217,7 +190,7 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────
   # Windows MSVC — GUI
-  # FIX 3: добавлен PlatformToolset=v143 (VS2022 — то что установлено)
+  # FIX: PlatformToolset=v143 (VS2022), WindowsTargetPlatformVersion=10.0
   # ─────────────────────────────────────────────────────────────────
   build-windows-msvc:
     name: Windows MSVC x64 (GUI)
@@ -248,8 +221,7 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────
   # Windows MinGW — CLI static
-  # FIX 4: перенесён на windows-latest где MinGW заголовки имеют
-  #         правильный регистр (Ws2tcpip.h, Windows.h и т.д.)
+  # FIX: runs on windows-latest (case-sensitive headers Ws2tcpip.h etc.)
   # ─────────────────────────────────────────────────────────────────
   build-windows-mingw:
     name: Windows MinGW static (${{ matrix.arch }})
@@ -265,13 +237,9 @@ jobs:
             flags: "-m32"
     steps:
       - uses: actions/checkout@v4
-      - name: Install MinGW via chocolatey
+      - name: Install MinGW
         shell: pwsh
-        run: |
-          choco install mingw --no-progress -y
-          # Refresh PATH
-          $env:PATH = [System.Environment]::GetEnvironmentVariable('PATH','Machine') + ';' + [System.Environment]::GetEnvironmentVariable('PATH','User')
-          g++ --version
+        run: choco install mingw --no-progress -y
       - name: Build TunSafe
         shell: bash
         run: |
@@ -294,7 +262,8 @@ jobs:
 
   # ─────────────────────────────────────────────────────────────────
   # Android NDK — сборка libnative-lib.so
-  # FIX 2: tunsafe_wg_plugin.h патчится в patch-sources
+  # FIX: CMakeLists использует -include wireguard.h (force-include)
+  #      вместо патча tunsafe_wg_plugin.h
   # ─────────────────────────────────────────────────────────────────
   build-android:
     name: Android NDK (${{ matrix.abi }})
@@ -312,9 +281,7 @@ jobs:
             api: 21
     steps:
       - uses: actions/checkout@v4
-
-      - name: Apply patches
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           name: patched-sources
 
