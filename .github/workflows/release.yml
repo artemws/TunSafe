@@ -64,7 +64,7 @@ jobs:
             crypto/chacha20/chacha20-x64-linux.s
       - name: Build TunSafe
         run: |
-          g++ -I . -O3 -DNDEBUG \
+          g++ -I . -O3 -DNDEBUG -DNO_PLUGIN \
             -DWITH_NETWORK_BSD=1 \
             -mssse3 -std=gnu++14 \
             -static -pthread \
@@ -99,7 +99,7 @@ jobs:
         run: sudo apt-get update -q && sudo apt-get install -y gcc-multilib g++-multilib
       - name: Build TunSafe
         run: |
-          g++ -m32 -I . -O3 -DNDEBUG \
+          g++ -m32 -I . -O3 -DNDEBUG -DNO_PLUGIN \
             -DWITH_NETWORK_BSD=1 \
             -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
             -mssse3 -std=gnu++14 \
@@ -137,7 +137,7 @@ jobs:
             set -e
             echo 'CXX=' \$CXX
             \$CXX \
-              -I . -O2 -DNDEBUG \
+              -I . -O2 -DNDEBUG -DNO_PLUGIN \
               -DWITH_NETWORK_BSD=1 \
               -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
               -mfpu=neon -march=armv7-a+fp \
@@ -174,7 +174,7 @@ jobs:
             set -e
             echo 'CXX=' \$CXX
             \$CXX \
-              -I . -O2 -DNDEBUG \
+              -I . -O2 -DNDEBUG -DNO_PLUGIN \
               -DWITH_NETWORK_BSD=1 \
               -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
               -std=gnu++14 -static -pthread \
