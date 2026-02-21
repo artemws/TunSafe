@@ -140,11 +140,14 @@ jobs:
           ./dockcross-armv7 bash -c "
             set -e
             echo 'CXX=' \$CXX
+            # dockcross/linux-armv7 uses gnueabi (soft-float ABI), NOT gnueabihf.
+            # -mfpu=neon and -march=armv7-a+fp are for hard-float toolchains and
+            # cause compilation failure here. Use plain -march=armv7-a instead.
             \$CXX \
               -I . -O2 -DNDEBUG \
               -DWITH_NETWORK_BSD=1 \
               -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
-              -mfpu=neon -march=armv7-a+fp \
+              -march=armv7-a \
               -std=gnu++14 -static -pthread \
               -o tunsafe-linux-armv7 \
               tunsafe_amalgam.cpp -lrt
@@ -446,7 +449,7 @@ jobs:
             |-----------|-------------|-----------|
             | Linux | x86_64 | static + ASM |
             | Linux | i686 | static |
-            | Linux | ARMv7 | static, NEON |
+            | Linux | ARMv7 | static |
             | Linux | AArch64 | static |
             | Windows | x86_64 GUI | MSVC v143 |
             | Android | arm64-v8a + armeabi-v7a + x86_64 | NDK r26d |
