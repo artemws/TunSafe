@@ -157,10 +157,12 @@ jobs:
           path: tunsafe-linux-armv7
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux AArch64 — dockcross
+  # Linux AArch64 — apt cross-compiler
+  # dockcross/linux-arm64 dropped: ld.bfd exits 127 on getaddrinfo
+  # with -static (same issue as ARMv7 dockcross toolchain).
   # ─────────────────────────────────────────────────────────────────
   build-linux-aarch64:
-    name: Linux AArch64/ARMv8 (dockcross static)
+    name: Linux AArch64/ARMv8 (static)
     runs-on: ubuntu-latest
     needs: patch-sources
     steps:
@@ -168,25 +170,21 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: patched-sources
-      - name: Setup dockcross aarch64
+      - name: Install cross-compiler
         run: |
-          docker run --rm dockcross/linux-arm64 > ./dockcross-aarch64
-          chmod +x ./dockcross-aarch64
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
       - name: Build TunSafe
         run: |
-          ./dockcross-aarch64 bash -c "
-            set -e
-            echo 'CXX=' \$CXX
-            \$CXX \
-              -I . -O2 -DNDEBUG \
-              -DWITH_NETWORK_BSD=1 \
-              -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
-              -std=gnu++14 -static -pthread \
-              -o tunsafe-linux-aarch64 \
-              tunsafe_amalgam.cpp -lrt
-            \$STRIP tunsafe-linux-aarch64
-            file tunsafe-linux-aarch64
-          "
+          aarch64-linux-gnu-g++ \
+            -I . -O2 -DNDEBUG \
+            -DWITH_NETWORK_BSD=1 \
+            -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
+            -std=gnu++14 -static -pthread \
+            -o tunsafe-linux-aarch64 \
+            tunsafe_amalgam.cpp -lrt
+          aarch64-linux-gnu-strip tunsafe-linux-aarch64
+          file tunsafe-linux-aarch64
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-linux-aarch64
