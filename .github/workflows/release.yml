@@ -70,6 +70,7 @@ jobs:
             -static -pthread \
             -o tunsafe-linux-x86_64 \
             tunsafe_amalgam.cpp \
+            wg_plugin_dummy.cpp \
             crypto/aesgcm/aesni_gcm-x64-linux.s \
             crypto/aesgcm/aesni-x64-linux.s \
             crypto/aesgcm/ghash-x64-linux.s \
@@ -106,6 +107,7 @@ jobs:
             -static -pthread \
             -o tunsafe-linux-i686 \
             tunsafe_amalgam.cpp \
+            wg_plugin_dummy.cpp \
             -lrt
           strip tunsafe-linux-i686
           file tunsafe-linux-i686
@@ -143,7 +145,8 @@ jobs:
               -mfpu=neon -march=armv7-a+fp \
               -std=gnu++14 -static -pthread \
               -o tunsafe-linux-armv7 \
-              tunsafe_amalgam.cpp -lrt
+              tunsafe_amalgam.cpp -lrt \
+              wg_plugin_dummy.cpp \
             \$STRIP tunsafe-linux-armv7
             file tunsafe-linux-armv7
           "
@@ -179,7 +182,8 @@ jobs:
               -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
               -std=gnu++14 -static -pthread \
               -o tunsafe-linux-aarch64 \
-              tunsafe_amalgam.cpp -lrt
+              tunsafe_amalgam.cpp -lrt \
+              wg_plugin_dummy.cpp \
             \$STRIP tunsafe-linux-aarch64
             file tunsafe-linux-aarch64
           "
