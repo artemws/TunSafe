@@ -69,6 +69,12 @@ need zip       zip
 need zipalign  "android-sdk (zipalign)"
 need apksigner "android-sdk (apksigner)"
 
+# ── Resolve all paths to absolute BEFORE changing directory ───────────────────
+# (must happen before keystore setup which uses OUTPUT_APK's dirname)
+LIBS_DIR="$(realpath "$LIBS_DIR")"
+INPUT_APK="$(realpath "$INPUT_APK")"
+OUTPUT_APK="$(cd "$(dirname "$OUTPUT_APK")"; pwd)/$(basename "$OUTPUT_APK")"
+
 # ── Keystore setup ────────────────────────────────────────────────────────────
 if [[ -z "$KEYSTORE" ]]; then
     KEYSTORE="$(dirname "$OUTPUT_APK")/debug.keystore"
@@ -92,6 +98,8 @@ fi
 [[ -f "$KEYSTORE" ]] || die "Keystore not found: $KEYSTORE"
 [[ -f "$INPUT_APK" ]] || die "Input APK not found: $INPUT_APK"
 [[ -d "$LIBS_DIR" ]]  || die "Libs directory not found: $LIBS_DIR"
+# Resolve KEYSTORE to absolute now that we know the file exists
+KEYSTORE="$(realpath "$KEYSTORE")"
 
 if [[ -z "$STOREPASS" ]]; then
     read -rsp "Keystore password: " STOREPASS; echo
