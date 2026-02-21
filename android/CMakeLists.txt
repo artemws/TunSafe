@@ -1,11 +1,16 @@
 # CMakeLists.txt — Android NDK build for libnative-lib.so
 #
 # Place at: <repo>/android/CMakeLists.txt
-# Source tree expected at: <repo>/  (one level up)
+# Source tree at:  <repo>/  (one level up)
 #
-# KEY POINT: We do NOT use tunsafe_amalgam.cpp because it includes
-# tunsafe_bsd.cpp, benchmark.cpp and ts.cpp which are not Android-compatible.
-# Instead we list only the files that work on Android.
+# We do NOT use tunsafe_amalgam.cpp because it pulls in tunsafe_bsd.cpp,
+# benchmark.cpp and ts.cpp which are not Android-compatible.
+# Sources are listed explicitly below.
+#
+# The fix for "unknown type name 'WireguardProcessor'" (tunsafe_wg_plugin.h:39)
+# is -include wireguard.h — a compiler force-include that runs BEFORE each
+# translation unit, ensuring WireguardProcessor is always declared first.
+# This avoids modifying any header (which breaks the amalgam build).
 
 cmake_minimum_required(VERSION 3.22)
 project(tunsafe_native VERSION 1.0 LANGUAGES CXX C)
@@ -26,8 +31,11 @@ set(COMMON_FLAGS
     -fvisibility=hidden
     -Wno-unused-parameter
     -Wno-missing-field-initializers
-    # Suppress noisy-but-harmless warnings from TunSafe sources
     -Wno-unused-result
+    # Force-include wireguard.h before every TU so that WireguardProcessor
+    # is always declared before tunsafe_wg_plugin.h uses it (line 39).
+    # This is the correct fix — patching the .h breaks the amalgam build.
+    -include "${TUNSAFE_ROOT}/wireguard.h"
 )
 
 if(ANDROID_ABI STREQUAL "armeabi-v7a")
@@ -36,10 +44,9 @@ endif()
 
 # ── Android-compatible WireGuard core sources ─────────────────────────────────
 # Equivalent to tunsafe_amalgam.cpp MINUS the non-Android files:
-#   - benchmark.cpp       (uses LARGE_INTEGER, Windows/Linux only)
-#   - tunsafe_bsd.cpp     (uses open_tun, GetDefaultRoute — no Android impl)
-#   - ts.cpp              (CLI main, not needed in .so)
-#   - network_bsd.cpp     (included via TUNSAFE_ROOT — keep it; it has Android path)
+#   - benchmark.cpp    (uses LARGE_INTEGER — Windows/Linux only)
+#   - tunsafe_bsd.cpp  (uses open_tun, GetDefaultRoute — no Android impl)
+#   - ts.cpp           (CLI main — not needed in .so)
 
 set(CORE_SOURCES
     "${TUNSAFE_ROOT}/wireguard.cpp"
@@ -59,7 +66,6 @@ set(CORE_SOURCES
     "${TUNSAFE_ROOT}/crypto/sha/sha1.cpp"
     "${TUNSAFE_ROOT}/network_common.cpp"
     "${TUNSAFE_ROOT}/network_bsd.cpp"
-    # Android JNI bridge and platform glue (this directory)
     "${CMAKE_CURRENT_SOURCE_DIR}/tunsafe_jni.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/tunsafe_android.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/network_android.cpp"
@@ -78,7 +84,6 @@ target_compile_options(native-lib PRIVATE ${COMMON_FLAGS})
 
 target_link_libraries(native-lib android log)
 
-# Strip in release
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_custom_command(TARGET native-lib POST_BUILD
         COMMAND ${CMAKE_STRIP} --strip-unneeded $<TARGET_FILE:native-lib>
