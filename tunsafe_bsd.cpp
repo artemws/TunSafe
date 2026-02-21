@@ -695,18 +695,16 @@ private:
 TunsafeBackendBsdImpl::TunsafeBackendBsdImpl() 
     : is_connected_(false),
       close_orphan_counter_(0),
-      plugin_(CreateTunsafePlugin(this, &processor_)),
+      plugin_(nullptr),
       processor_(this, this, this),
       network_(this, 1000),
       tun_(&network_, &processor_), 
       udp_(&network_, &processor_),
       unix_socket_listener_(&network_, &processor_),
       tcp_socket_listener_(&network_, &processor_) {
-  processor_.dev().SetPlugin(plugin_);
 }
 
 TunsafeBackendBsdImpl::~TunsafeBackendBsdImpl() {
-  delete plugin_;
 }
 
 bool TunsafeBackendBsdImpl::InitializeTun(char devname[16]) {
