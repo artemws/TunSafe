@@ -219,7 +219,7 @@ jobs:
           # NASM expects ; — replace standalone # comment lines with ;
           $f = "crypto\curve25519\curve25519-x64-win.asm"
           (Get-Content $f) -replace '^#\s*(.*)', '; $1' | Set-Content $f
-          Write-Host "Patched $f:"
+          Write-Host "Patched ${f}"
           Get-Content $f | Select-Object -Skip 9 -First 6
       - name: Build
         run: |
