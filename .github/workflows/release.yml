@@ -199,18 +199,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v2
-      - name: Install NASM
-        run: choco install nasm --no-progress -y
-      - name: Add NASM to PATH
+      - name: Install NASM and fix ASM sources
         shell: pwsh
         run: |
+          choco install nasm --no-progress -y
           # nasm.targets hardcodes c:\dev\nasm\nasm.exe — create a shim there
-          $nasm = (Get-Command nasm -ErrorAction SilentlyContinue)?.Source
-          if (-not $nasm) { $nasm = "C:\ProgramData\chocolatey\bin\nasm.exe" }
+          $nasm = "C:\ProgramData\chocolatey\bin\nasm.exe"
           New-Item -ItemType Directory -Force "C:\dev\nasm" | Out-Null
           Copy-Item $nasm "C:\dev\nasm\nasm.exe"
-          Write-Host "NASM shim: C:\dev\nasm\nasm.exe"
-          & "C:\dev\nasm\nasm.exe" -v
+          Write-Host "NASM: $(& 'C:\dev\nasm\nasm.exe' -v)"
+          # curve25519-x64-win.asm uses # for comments (GAS/YASM syntax).
+          # NASM expects ; — replace standalone # comment lines with ;
+          $f = "crypto\curve25519\curve25519-x64-win.asm"
+          (Get-Content $f) -replace '^#\s*(.*)', '; $1' | Set-Content $f
+          Write-Host "Patched $f"
+          Get-Content $f | Select-Object -Skip 9 -First 6
       - name: Build
         run: |
           msbuild TunSafe.sln `
