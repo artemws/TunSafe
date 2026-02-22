@@ -256,7 +256,7 @@ jobs:
             $vcx | Set-Content TunSafe.vcxproj -Encoding UTF8
             Write-Host "Patched TunSafe.vcxproj"
           }
-      - name: Build
+      - name: Build x64
         run: |
           msbuild TunSafe.sln `
             /p:Configuration=Release `
@@ -264,18 +264,35 @@ jobs:
             /p:WindowsTargetPlatformVersion=10.0 `
             /p:PlatformToolset=v143 `
             /m /nologo
+      - name: Build Win32
+        run: |
+          msbuild TunSafe.sln `
+            /p:Configuration=Release `
+            /p:Platform=Win32 `
+            /p:WindowsTargetPlatformVersion=10.0 `
+            /p:PlatformToolset=v143 `
+            /m /nologo
       - name: Collect artifacts
         shell: pwsh
         run: |
-          New-Item -Force -ItemType Directory dist | Out-Null
+          New-Item -Force -ItemType Directory dist\x64   | Out-Null
+          New-Item -Force -ItemType Directory dist\Win32 | Out-Null
           Get-ChildItem -Recurse -Filter "*.exe" |
             Where-Object { $_.FullName -match 'x64.Release' } |
-            ForEach-Object { Copy-Item $_.FullName dist\ -Force }
-          dir dist
+            ForEach-Object { Copy-Item $_.FullName dist\x64\ -Force }
+          Get-ChildItem -Recurse -Filter "*.exe" |
+            Where-Object { $_.FullName -match 'Win32.Release' } |
+            ForEach-Object { Copy-Item $_.FullName dist\Win32\ -Force }
+          dir dist\x64
+          dir dist\Win32
       - uses: actions/upload-artifact@v4
         with:
           name: tunsafe-windows-msvc-x64
-          path: dist\
+          path: dist\x64\
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunsafe-windows-msvc-win32
+          path: dist\Win32\
 
 
   # ─────────────────────────────────────────────────────────────────
