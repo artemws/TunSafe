@@ -199,6 +199,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: microsoft/setup-msbuild@v2
+      - name: Install NASM
+        run: choco install nasm --no-progress -y
+      - name: Add NASM to PATH
+        shell: pwsh
+        run: |
+          # nasm.targets hardcodes c:\dev\nasm\nasm.exe — create a shim there
+          $nasm = (Get-Command nasm -ErrorAction SilentlyContinue)?.Source
+          if (-not $nasm) { $nasm = "C:\ProgramData\chocolatey\bin\nasm.exe" }
+          New-Item -ItemType Directory -Force "C:\dev\nasm" | Out-Null
+          Copy-Item $nasm "C:\dev\nasm\nasm.exe"
+          Write-Host "NASM shim: C:\dev\nasm\nasm.exe"
+          & "C:\dev\nasm\nasm.exe" -v
       - name: Build
         run: |
           msbuild TunSafe.sln `
