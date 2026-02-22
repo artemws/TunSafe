@@ -238,9 +238,23 @@ jobs:
           # linker can resolve the symbol.  The Windows GUI does not use the 2FA
           # plugin at runtime, so returning nullptr is safe.
           $wgp = Get-Content tunsafe_wg_plugin.cpp -Raw
-          if ($wgp -notmatch 'CreateTunsafePlugin\s*\(.*\)\s*\{') {
-            Add-Content tunsafe_wg_plugin.cpp "`r`n// Stub added by CI: definition was missing from this repo version.`r`nTunsafePlugin *CreateTunsafePlugin(PluginDelegate *del, WireguardProcessor *wgp) { return nullptr; }"
-            Write-Host "Added CreateTunsafePlugin stub to tunsafe_wg_plugin.cpp"
+          if ($wgp -notmatch 'CreateTunsafePlugin[^;]+\{') {
+            # Write stub as separate .cpp with proper includes (here-string avoided
+            # to keep YAML valid; use individual Set-Content calls instead).
+            $lines = (
+              '#include "stdafx.h"',
+              '#include "tunsafe_wg_plugin.h"',
+              '#include "wireguard.h"',
+              '// Stub: definition absent from this repo version.',
+              'TunsafePlugin *CreateTunsafePlugin(PluginDelegate *del, WireguardProcessor *wgp) { return nullptr; }'
+            )
+            $lines | Set-Content tunsafe_wg_plugin_stub.cpp -Encoding UTF8
+            Write-Host "Wrote tunsafe_wg_plugin_stub.cpp"
+            # Inject into vcxproj so MSVC compiles and links it
+            $vcx = Get-Content TunSafe.vcxproj -Raw
+            $vcx = $vcx -replace '(<ClCompile Include="tunsafe_wg_plugin\.cpp" />)', '$1<ClCompile Include="tunsafe_wg_plugin_stub.cpp" />'
+            $vcx | Set-Content TunSafe.vcxproj -Encoding UTF8
+            Write-Host "Patched TunSafe.vcxproj"
           }
       - name: Build
         run: |
