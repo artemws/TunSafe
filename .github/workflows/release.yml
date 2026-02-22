@@ -220,45 +220,6 @@ jobs:
           name: tunsafe-windows-msvc-x64
           path: dist\
 
-  # ─────────────────────────────────────────────────────────────────
-  # Windows MinGW — CLI static (на windows-latest)
-  # ─────────────────────────────────────────────────────────────────
-  build-windows-mingw:
-    name: Windows MinGW static (${{ matrix.arch }})
-    runs-on: windows-latest
-    continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            flags: ""
-          - arch: i686
-            flags: "-m32"
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install MinGW
-        shell: pwsh
-        run: choco install mingw --no-progress -y
-      - name: Build TunSafe
-        shell: bash
-        run: |
-          export PATH="/c/ProgramData/chocolatey/lib/mingw/tools/install/mingw64/bin:$PATH"
-          g++ \
-            ${{ matrix.flags }} \
-            -I . -O3 -DNDEBUG \
-            -DWITH_NETWORK_WIN32=1 \
-            -DCHACHA20_WITH_ASM=0 -DBLAKE2S_WITH_ASM=0 \
-            -std=gnu++14 -static \
-            -o tunsafe-windows-${{ matrix.arch }}.exe \
-            tunsafe_amalgam.cpp \
-            -lws2_32 -liphlpapi -lwinmm
-          strip tunsafe-windows-${{ matrix.arch }}.exe
-      - uses: actions/upload-artifact@v4
-        if: success()
-        with:
-          name: tunsafe-windows-mingw-${{ matrix.arch }}
-          path: tunsafe-windows-${{ matrix.arch }}.exe
 
   # ─────────────────────────────────────────────────────────────────
   # Android NDK — сборка libnative-lib.so
@@ -344,11 +305,26 @@ jobs:
           name: so-x86_64
           path: build/android/libs/x86_64
 
-      - name: Verify libs
+      - name: Verify and flatten libs
         run: |
-          echo "Libs:"
+          echo "=== Raw download tree ==="
+          find build/android/libs -type f | sort
+          echo "==="
+          # upload-artifact v4 may preserve subdirectory paths from the upload source.
+          # Flatten: move any libnative-lib.so into the correct ABI directory.
+          for abi in arm64-v8a armeabi-v7a x86_64; do
+            expected="build/android/libs/${abi}/libnative-lib.so"
+            if [ ! -f "$expected" ]; then
+              found=$(find "build/android/libs/${abi}" -name "libnative-lib.so" | head -1)
+              if [ -n "$found" ]; then
+                mv "$found" "$expected"
+                echo "Flattened: $abi"
+              fi
+            fi
+          done
+          echo "=== Final libs ==="
           find build/android/libs -name "*.so" | sort
-          find build/android/libs -name "*.so" | grep -q . || { echo "ERROR: no .so files found"; exit 1; }
+          find build/android/libs -name "libnative-lib.so" | grep -q . || { echo "ERROR: no .so files found"; exit 1; }
 
       - name: Install zipalign + apksigner
         run: sudo apt-get update -q && sudo apt-get install -y zipalign apksigner
@@ -410,7 +386,6 @@ jobs:
       - build-linux-armv7
       - build-linux-aarch64
       - build-windows-msvc
-      - build-windows-mingw
       - assemble-android-apk
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
@@ -453,7 +428,7 @@ jobs:
             | Linux | i686 | static |
             | Linux | ARMv7 | static |
             | Linux | AArch64 | static |
-            | Windows | x86_64 GUI | MSVC v143 |
+            | Windows | x86_64 | MSVC GUI |
             | Android | arm64-v8a + armeabi-v7a + x86_64 | NDK r26d |
 
             Проверка целостности: `SHA256SUMS.txt`
