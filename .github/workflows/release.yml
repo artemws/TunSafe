@@ -203,16 +203,23 @@ jobs:
         shell: pwsh
         run: |
           choco install nasm --no-progress -y
-          # nasm.targets hardcodes c:\dev\nasm\nasm.exe — create a shim there
-          $nasm = "C:\ProgramData\chocolatey\bin\nasm.exe"
+          # choco installs NASM as EXE into its own dir, not chocolatey\bin.
+          # Find it and shim to c:\dev\nasm\nasm.exe (hardcoded in nasm.targets).
+          $nasm = Get-ChildItem "C:\Program Files\NASM","C:\NASM" -Filter nasm.exe -Recurse -ErrorAction SilentlyContinue |
+                  Select-Object -First 1 -ExpandProperty FullName
+          if (-not $nasm) {
+            $nasm = Get-ChildItem "C:\ProgramData\chocolatey" -Filter nasm.exe -Recurse -ErrorAction SilentlyContinue |
+                    Select-Object -First 1 -ExpandProperty FullName
+          }
+          Write-Host "Found NASM at: $nasm"
           New-Item -ItemType Directory -Force "C:\dev\nasm" | Out-Null
           Copy-Item $nasm "C:\dev\nasm\nasm.exe"
-          Write-Host "NASM: $(& 'C:\dev\nasm\nasm.exe' -v)"
+          Write-Host "NASM version: $(& 'C:\dev\nasm\nasm.exe' -v)"
           # curve25519-x64-win.asm uses # for comments (GAS/YASM syntax).
           # NASM expects ; — replace standalone # comment lines with ;
           $f = "crypto\curve25519\curve25519-x64-win.asm"
           (Get-Content $f) -replace '^#\s*(.*)', '; $1' | Set-Content $f
-          Write-Host "Patched $f"
+          Write-Host "Patched $f:"
           Get-Content $f | Select-Object -Skip 9 -First 6
       - name: Build
         run: |
