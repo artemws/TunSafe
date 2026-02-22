@@ -233,6 +233,15 @@ jobs:
             '#include "stdafx.h"', '' + $lines | Set-Content tunsafe_wg_plugin.cpp
             Write-Host "Prepended stdafx.h to tunsafe_wg_plugin.cpp"
           }
+          # If CreateTunsafePlugin is not defined in tunsafe_wg_plugin.cpp
+          # (some repo versions only have a stub/header), add a null stub so the
+          # linker can resolve the symbol.  The Windows GUI does not use the 2FA
+          # plugin at runtime, so returning nullptr is safe.
+          $wgp = Get-Content tunsafe_wg_plugin.cpp -Raw
+          if ($wgp -notmatch 'CreateTunsafePlugin\s*\(.*\)\s*\{') {
+            Add-Content tunsafe_wg_plugin.cpp "`r`n// Stub added by CI: definition was missing from this repo version.`r`nTunsafePlugin *CreateTunsafePlugin(PluginDelegate *del, WireguardProcessor *wgp) { return nullptr; }"
+            Write-Host "Added CreateTunsafePlugin stub to tunsafe_wg_plugin.cpp"
+          }
       - name: Build
         run: |
           msbuild TunSafe.sln `
