@@ -110,6 +110,12 @@ bool WgFileParser::ParseFlag(const char *group, const char *key, char *value) {
       wg_->SetListenPort(atoi(value));
     } else if (strcmp(key, "ListenPortTCP") == 0) {
       wg_->SetListenPortTcp(atoi(value));
+    } else if (strcmp(key, "TcpProxyTarget") == 0) {
+      // Format: domain:port  e.g. "example.com:443"
+      char *colon = strrchr(value, ':');
+      if (!colon) goto err;
+      *colon = '\0';
+      wg_->SetTcpProxyTarget(value, atoi(colon + 1));
     } else if (strcmp(key, "Address") == 0) {
       SplitString(value, ',', &ss);
       for (size_t i = 0; i < ss.size(); i++) {
