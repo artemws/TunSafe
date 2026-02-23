@@ -33,4 +33,4 @@
 #define WITH_BENCHMARK 1
 
 // Use bytell hashmap instead. Only works in 64-bit builds
-#define WITH_BYTELL_HASHMAP 1
+#define WITH_BYTELL_HASHMAP 0
