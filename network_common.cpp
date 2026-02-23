@@ -131,8 +131,15 @@ TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfusc
   if (obfuscator->enabled() && obfuscator->obfuscate_tcp() != TcpPacketHandler::kObfuscationMode_None) {
     memcpy(encryptor_.buf, obfuscator->key(), CHACHA20POLY1305_KEYLEN);
     memcpy(decryptor_.buf, obfuscator->key(), CHACHA20POLY1305_KEYLEN);
-    obfuscation_mode_ = obfuscator->obfuscate_tcp() != TcpPacketHandler::kObfuscationMode_Unspecified ? obfuscator->obfuscate_tcp() :
-        (is_incoming ? TcpPacketHandler::kObfuscationMode_Autodetect : TcpPacketHandler::kObfuscationMode_Encrypted);
+    if (is_incoming) {
+      // Server must always autodetect: it doesn't know whether the incoming
+      // connection is a TunSafe client, a real browser (TLS), or plaintext HTTP.
+      obfuscation_mode_ = kObfuscationMode_Autodetect;
+    } else {
+      obfuscation_mode_ = obfuscator->obfuscate_tcp() != TcpPacketHandler::kObfuscationMode_Unspecified
+          ? obfuscator->obfuscate_tcp()
+          : kObfuscationMode_Encrypted;
+    }
     read_state_ = (obfuscation_mode_ == kObfuscationMode_Encrypted) ? READ_CRYPTO_HEADER : READ_PACKET_HEADER;
   } else if (!obfuscator->enabled() && obfuscator->obfuscate_tcp() > TcpPacketHandler::kObfuscationMode_None) {
     RERROR("No ObfuscateKey specified. Disabling TCP obfuscation.");
