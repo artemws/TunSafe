@@ -4,6 +4,7 @@
 
 #include "tunsafe_types.h"
 #include "wireguard_proto.h"
+#include <string>
 
 // todo: for multithreaded use case need to use atomic ops.
 struct WgProcessorStats {
@@ -86,6 +87,10 @@ public:
 
   void SetListenPort(int listen_port);
   void SetListenPortTcp(int listen_port);
+  void SetTcpProxyTarget(const char *domain, int port);
+
+  const std::string &proxy_domain() const { return proxy_domain_; }
+  uint16 proxy_port() const { return proxy_port_; }
 
   void AddDnsServer(const IpAddr &sin);
   bool SetTunAddress(const WgCidrAddr &addr);
@@ -160,6 +165,10 @@ private:
   uint16 listen_port_;
   uint16 listen_port_tcp_;
   uint16 mtu_;
+  // Domain and port to proxy unrecognized incoming TCP connections to.
+  // Empty string means disabled.
+  std::string proxy_domain_;
+  uint16 proxy_port_;
 
   bool dns_blocking_;
   uint8 internet_blocking_;
