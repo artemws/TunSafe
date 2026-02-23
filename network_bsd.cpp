@@ -1080,21 +1080,42 @@ void TcpSocketBsd::DoRead() {
     net->ReallocateIov(j);
   }
 
+  bool got_wireguard_packet = false;
   while (Packet *p = tcp_packet_handler_.GetNextWireguardPacket()) {
+    got_wireguard_packet = true;
     p->protocol = endpoint_protocol_;
     p->addr = endpoint_;
     processor_->HandleUdpPacket(p, network_->overload_);
-    proxy_timeout_ = 0;  // valid WireGuard data — disarm proxy timer
-    tcp_packet_handler_.ClearReplayBuffer();  // no longer need replay mirror
+    tcp_packet_handler_.ClearReplayBuffer();  // authenticated — free replay mirror
   }
 
-  // First time we see a real TLS ClientHello (0x1603), arm the 3-second proxy timer.
-  // We cannot proxy immediately: a TunSafe client also starts with 0x1603 but
-  // immediately follows with encrypted WireGuard data (handled above).
-  // A real browser sends 0x1603 then WAITS for ServerHello — deadlock without timer.
-  if (tcp_packet_handler_.real_tls_detected() && proxy_timeout_ == 0 &&
-      !processor_->proxy_domain().empty() && processor_->proxy_port() != 0) {
-    proxy_timeout_ = 3;
+  // Distinguish browser from TunSafe client without a timer:
+  //
+  // TunSafe client: sends fake ClientHello (0x1603) immediately followed by
+  //   ChangeCipherSpec + encrypted WireGuard data — all usually in the same
+  //   TCP segment.  By the time GetNextWireguardPacket() returns, either
+  //   got_wireguard_packet==true or queue_size()>0 (more data pending).
+  //
+  // Real browser: sends ClientHello, then STOPS and waits for ServerHello.
+  //   After GetNextWireguardPacket() the queue is empty and no WG packet arrived.
+  //
+  // So: ClientHello parsed + empty queue + no WG packet = browser → proxy now.
+  // If ClientHello hasn't been fully parsed yet (split across reads), arm a
+  // 1-second fallback timer so we don't block forever.
+  if (!processor_->proxy_domain().empty() && processor_->proxy_port() != 0) {
+    if (tcp_packet_handler_.client_hello_parsed() && !got_wireguard_packet &&
+        tcp_packet_handler_.queue_size() == 0) {
+      // Empty queue right after ClientHello — this is a browser.
+      if (!LaunchProxy())
+        CloseSocketAndDestroy();
+      return;
+    }
+    if (tcp_packet_handler_.real_tls_detected() && proxy_timeout_ == 0 &&
+        !got_wireguard_packet) {
+      proxy_timeout_ = 1;  // fallback: ClientHello split across reads
+    }
+    if (got_wireguard_packet)
+      proxy_timeout_ = 0;  // disarm — authenticated TunSafe client
   }
 
   if (tcp_packet_handler_.error() || bytes_read_org == 0) {
