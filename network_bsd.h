@@ -262,6 +262,8 @@ public:
   uint8 endpoint_protocol() { return endpoint_protocol_; }
   const IpAddr &endpoint() { return endpoint_; }
 
+  virtual void Periodic() override;
+
   static void WriteTcpPacket(NetworkBsd *network, WireguardProcessor *processor, Packet *packet);
 
 public:
@@ -270,6 +272,7 @@ private:
   void DoRead();
   void DoWrite();
   void CloseSocketAndDestroy();
+  bool LaunchProxy();
 
   bool readable_, writable_;
   bool got_eof_;
@@ -277,6 +280,10 @@ private:
   bool want_connect_;
   uint8 handshake_attempts_;
   uint32 handshake_timestamp_;
+  // Countdown in seconds: when it hits zero on an unauthenticated incoming
+  // connection that sent a real TLS ClientHello, we launch the proxy.
+  // 0 = not armed.
+  uint8 proxy_timeout_;
   
   uint wqueue_packets_;
   Packet *wqueue_, **wqueue_end_;
