@@ -898,6 +898,7 @@ TcpSocketBsd::TcpSocketBsd(NetworkBsd *net, WireguardProcessor *processor, bool 
       age(0),
       handshake_attempts_(0),
       handshake_timestamp_(0),
+      proxy_timeout_(0),
       wqueue_(NULL),
       wqueue_end_(&wqueue_),
       wqueue_packets_(0),
@@ -1000,6 +1001,64 @@ void TcpSocketBsd::DoEndloop() {
     DoWrite();
 }
 
+// Launch a transparent TCP proxy to TcpProxyTarget.
+// Steals fd_ and all buffered bytes, creates TcpProxySocketBsd, then deletes *this.
+// Returns true if proxy was launched (caller must NOT touch *this after this call).
+bool TcpSocketBsd::LaunchProxy() {
+  const std::string &dom = processor_->proxy_domain();
+  if (dom.empty() || processor_->proxy_port() == 0)
+    return false;
+
+  struct addrinfo hints = {}, *ai = NULL;
+  hints.ai_family   = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  char portstr[8];
+  snprintf(portstr, sizeof(portstr), "%u", (unsigned)processor_->proxy_port());
+  int rc = getaddrinfo(dom.c_str(), portstr, &hints, &ai);
+  if (rc != 0 || !ai) {
+    RERROR("TcpProxy: failed to resolve %s: %s", dom.c_str(),
+           rc ? gai_strerror(rc) : "no results");
+    return false;
+  }
+
+  int rfd = socket(ai->ai_family, SOCK_STREAM, 0);
+  if (rfd < 0) {
+    RERROR("TcpProxy: socket() failed: %s", strerror(errno));
+    freeaddrinfo(ai);
+    return false;
+  }
+  fcntl(rfd, F_SETFD, FD_CLOEXEC);
+  fcntl(rfd, F_SETFL, O_NONBLOCK);
+  connect(rfd, ai->ai_addr, (socklen_t)ai->ai_addrlen);  // EINPROGRESS is ok
+  freeaddrinfo(ai);
+
+  Packet *buf_head = NULL;
+  Packet **buf_tail = &buf_head;
+  uint32 buf_bytes = 0;
+  tcp_packet_handler_.StealRawQueue(&buf_head, &buf_tail, &buf_bytes);
+
+  int cfd = StealFd();
+  RINFO("TcpProxy: forwarding to %s:%u (%u buffered bytes)",
+        dom.c_str(), (unsigned)processor_->proxy_port(), buf_bytes);
+
+  new TcpProxySocketBsd(network_, cfd, rfd, buf_head, buf_tail, buf_bytes);
+  delete this;  // fd_ already stolen — CloseSocket() will not double-close
+  return true;
+}
+
+void TcpSocketBsd::Periodic() {
+  if (proxy_timeout_ == 0)
+    return;
+  if (--proxy_timeout_ > 0)
+    return;
+  // Timer expired: no valid WireGuard packet arrived after TLS ClientHello.
+  // This is a real browser — launch the proxy.
+  RINFO("TcpProxy: timeout after TLS ClientHello, proxying to upstream");
+  if (!LaunchProxy())
+    CloseSocketAndDestroy();
+  // *this may be deleted — do not touch after this point.
+}
+
 void TcpSocketBsd::DoRead() {
   ssize_t bytes_read = readv(fd_, network_->iov_, NetworkBsd::kMaxIovec);
   ssize_t bytes_read_org = bytes_read;
@@ -1010,7 +1069,7 @@ void TcpSocketBsd::DoRead() {
     }
     return;
   }
-  // Go through and read the packet structures that are ready and queue them up
+
   NetworkBsd *net = network_;
   for (size_t j = 0; bytes_read; j++) {
     size_t m = std::min<size_t>(bytes_read, net->iov_[j].iov_len);
@@ -1020,98 +1079,34 @@ void TcpSocketBsd::DoRead() {
     tcp_packet_handler_.QueueIncomingPacket(p);
     net->ReallocateIov(j);
   }
-  // Parse it all
+
   while (Packet *p = tcp_packet_handler_.GetNextWireguardPacket()) {
     p->protocol = endpoint_protocol_;
     p->addr = endpoint_;
     processor_->HandleUdpPacket(p, network_->overload_);
+    proxy_timeout_ = 0;  // valid WireGuard data — disarm proxy timer
   }
 
-  // Early proxy launch: if we detected a real TLS ClientHello (browser doing https://)
-  // we must immediately forward to upstream WITHOUT waiting for error_flag_.
-  // Otherwise we deadlock: browser waits for ServerHello, we wait for WireGuard data.
-  // Similarly for plaintext HTTP: forward it to the proxy target HTTP port.
-  const std::string &dom = processor_->proxy_domain();
-  if (!dom.empty() && processor_->proxy_port() != 0) {
-    bool should_proxy = tcp_packet_handler_.real_tls_detected() ||
-                        tcp_packet_handler_.plaintext_detected();
-    if (should_proxy) {
-      struct addrinfo hints = {}, *ai = NULL;
-      hints.ai_family   = AF_UNSPEC;
-      hints.ai_socktype = SOCK_STREAM;
-      char portstr[8];
-      snprintf(portstr, sizeof(portstr), "%u", (unsigned)processor_->proxy_port());
-      int rc = getaddrinfo(dom.c_str(), portstr, &hints, &ai);
-      if (rc == 0 && ai) {
-        int rfd = socket(ai->ai_family, SOCK_STREAM, 0);
-        if (rfd >= 0) {
-          fcntl(rfd, F_SETFD, FD_CLOEXEC);
-          fcntl(rfd, F_SETFL, O_NONBLOCK);
-          connect(rfd, ai->ai_addr, (socklen_t)ai->ai_addrlen);
-          Packet *buf_head = NULL;
-          Packet **buf_tail = &buf_head;
-          uint32 buf_bytes = 0;
-          tcp_packet_handler_.StealRawQueue(&buf_head, &buf_tail, &buf_bytes);
-          int cfd = StealFd();
-          RINFO("TcpProxy: early forward (%s) to %s:%u (%u bytes buffered)",
-                tcp_packet_handler_.real_tls_detected() ? "TLS" : "plaintext",
-                dom.c_str(), (unsigned)processor_->proxy_port(), buf_bytes);
-          freeaddrinfo(ai);
-          new TcpProxySocketBsd(net, cfd, rfd, buf_head, buf_tail, buf_bytes);
-          delete this;
-          return;
-        }
-        freeaddrinfo(ai);
-      } else {
-        RERROR("TcpProxy: failed to resolve %s: %s", dom.c_str(),
-               rc ? gai_strerror(rc) : "no results");
-      }
-    }
+  // First time we see a real TLS ClientHello (0x1603), arm the 3-second proxy timer.
+  // We cannot proxy immediately: a TunSafe client also starts with 0x1603 but
+  // immediately follows with encrypted WireGuard data (handled above).
+  // A real browser sends 0x1603 then WAITS for ServerHello — deadlock without timer.
+  if (tcp_packet_handler_.real_tls_detected() && proxy_timeout_ == 0 &&
+      !processor_->proxy_domain().empty() && processor_->proxy_port() != 0) {
+    proxy_timeout_ = 3;
   }
 
   if (tcp_packet_handler_.error() || bytes_read_org == 0) {
-    // If a proxy target is configured and the client sent an unrecognized TLS
-    // handshake, forward the connection transparently instead of dropping it.
-    const std::string &dom = processor_->proxy_domain();
-    if (tcp_packet_handler_.error() && !dom.empty() && processor_->proxy_port() != 0) {
-      // Resolve the upstream host synchronously (done once at this point).
-      struct addrinfo hints = {}, *ai = NULL;
-      hints.ai_family   = AF_UNSPEC;
-      hints.ai_socktype = SOCK_STREAM;
-      char portstr[8];
-      snprintf(portstr, sizeof(portstr), "%u", (unsigned)processor_->proxy_port());
-      int rc = getaddrinfo(dom.c_str(), portstr, &hints, &ai);
-      if (rc == 0 && ai) {
-        int rfd = socket(ai->ai_family, SOCK_STREAM, 0);
-        if (rfd >= 0) {
-          fcntl(rfd, F_SETFD, FD_CLOEXEC);
-          fcntl(rfd, F_SETFL, O_NONBLOCK);
-          connect(rfd, ai->ai_addr, (socklen_t)ai->ai_addrlen); // non-blocking: EINPROGRESS ok
-          // Steal buffered client bytes (the original ClientHello etc.)
-          Packet *buf_head = NULL;
-          Packet **buf_tail = &buf_head;
-          uint32 buf_bytes = 0;
-          tcp_packet_handler_.StealRawQueue(&buf_head, &buf_tail, &buf_bytes);
-          // Steal the client fd from this socket without closing it
-          int cfd = StealFd();
-          RINFO("TcpProxy: forwarding unrecognized TLS to %s:%u (%u buffered bytes)",
-                dom.c_str(), (unsigned)processor_->proxy_port(), buf_bytes);
-          freeaddrinfo(ai);
-          // TcpProxySocketBsd takes ownership of both fds and the buffered packets
-          new TcpProxySocketBsd(net, cfd, rfd, buf_head, buf_tail, buf_bytes);
-          // Destroy *this* (fd_ already stolen, so CloseSocket won't double-close)
-          delete this;
-          return;
-        }
-        freeaddrinfo(ai);
-      } else {
-        RERROR("TcpProxy: failed to resolve %s: %s", dom.c_str(),
-               rc ? gai_strerror(rc) : "no results");
-      }
+    // plaintext HTTP or other unrecognised stream → proxy or close
+    if (tcp_packet_handler_.error() && !processor_->proxy_domain().empty()) {
+      if (!LaunchProxy())
+        CloseSocketAndDestroy();
+    } else {
+      CloseSocketAndDestroy();
     }
-    CloseSocketAndDestroy();
   }
 }
+
 
 void TcpSocketBsd::DoWrite() {
   enum { kMaxIoWrite = 16 };
