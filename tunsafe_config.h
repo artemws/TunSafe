@@ -21,7 +21,7 @@
 #define WITH_SHORT_MAC 1
 
 // Enable support for the keypair->compress_handler_ feature
-#define WITH_PACKET_COMPRESSION 1
+#define WITH_PACKET_COMPRESSION 0
  
 // Enable support for short (down to 2 byte headers) instead of 16 bytes
 #define WITH_SHORT_HEADERS 1
@@ -30,7 +30,7 @@
 #define WITH_CIPHER_SUITES 1
 
 #define WITH_AVX512_OPTIMIZATIONS 1
-#define WITH_BENCHMARK 1
+#define WITH_BENCHMARK 0
 
 // Use bytell hashmap instead. Only works in 64-bit builds
 #define WITH_BYTELL_HASHMAP 0
