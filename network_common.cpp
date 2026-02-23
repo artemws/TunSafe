@@ -139,6 +139,8 @@ TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfusc
   }
   tls_read_state_ = 0;
   error_flag_ = false;
+  real_tls_detected_ = false;
+  plaintext_detected_ = false;
   decryptor_initialized_ = false;
   predicted_key_in_ = predicted_key_out_ = 0;
   predicted_serial_in_ = predicted_serial_out_ = 0;
@@ -708,12 +710,17 @@ Packet *TcpPacketHandler::GetNextWireguardPacket() {
 
     uint16 header = queue_.PeekUint16();
     if (header == 0x1603) {
-      // TLS ClientHello - treat as our TLS obfuscation mode.
+      // Real TLS ClientHello from a browser or other TLS client.
+      // Flag it so DoRead can immediately start the proxy without waiting
+      // for error_flag_ (which would deadlock since the browser waits for ServerHello).
+      real_tls_detected_ = true;
       obfuscation_mode_ = kObfuscationMode_Tls;
     } else if (header <= 1500) {
       // Unobfuscated wireguard headers always start with a low value.
       obfuscation_mode_ = kObfuscationMode_None;
     } else {
+      // Plaintext HTTP or other non-TLS stream.
+      plaintext_detected_ = true;
       read_state_ = READ_CRYPTO_HEADER;
       obfuscation_mode_ = kObfuscationMode_Encrypted;
     }
