@@ -1027,6 +1027,48 @@ void TcpSocketBsd::DoRead() {
     processor_->HandleUdpPacket(p, network_->overload_);
   }
 
+  // Early proxy launch: if we detected a real TLS ClientHello (browser doing https://)
+  // we must immediately forward to upstream WITHOUT waiting for error_flag_.
+  // Otherwise we deadlock: browser waits for ServerHello, we wait for WireGuard data.
+  // Similarly for plaintext HTTP: forward it to the proxy target HTTP port.
+  const std::string &dom = processor_->proxy_domain();
+  if (!dom.empty() && processor_->proxy_port() != 0) {
+    bool should_proxy = tcp_packet_handler_.real_tls_detected() ||
+                        tcp_packet_handler_.plaintext_detected();
+    if (should_proxy) {
+      struct addrinfo hints = {}, *ai = NULL;
+      hints.ai_family   = AF_UNSPEC;
+      hints.ai_socktype = SOCK_STREAM;
+      char portstr[8];
+      snprintf(portstr, sizeof(portstr), "%u", (unsigned)processor_->proxy_port());
+      int rc = getaddrinfo(dom.c_str(), portstr, &hints, &ai);
+      if (rc == 0 && ai) {
+        int rfd = socket(ai->ai_family, SOCK_STREAM, 0);
+        if (rfd >= 0) {
+          fcntl(rfd, F_SETFD, FD_CLOEXEC);
+          fcntl(rfd, F_SETFL, O_NONBLOCK);
+          connect(rfd, ai->ai_addr, (socklen_t)ai->ai_addrlen);
+          Packet *buf_head = NULL;
+          Packet **buf_tail = &buf_head;
+          uint32 buf_bytes = 0;
+          tcp_packet_handler_.StealRawQueue(&buf_head, &buf_tail, &buf_bytes);
+          int cfd = StealFd();
+          RINFO("TcpProxy: early forward (%s) to %s:%u (%u bytes buffered)",
+                tcp_packet_handler_.real_tls_detected() ? "TLS" : "plaintext",
+                dom.c_str(), (unsigned)processor_->proxy_port(), buf_bytes);
+          freeaddrinfo(ai);
+          new TcpProxySocketBsd(net, cfd, rfd, buf_head, buf_tail, buf_bytes);
+          delete this;
+          return;
+        }
+        freeaddrinfo(ai);
+      } else {
+        RERROR("TcpProxy: failed to resolve %s: %s", dom.c_str(),
+               rc ? gai_strerror(rc) : "no results");
+      }
+    }
+  }
+
   if (tcp_packet_handler_.error() || bytes_read_org == 0) {
     // If a proxy target is configured and the client sent an unrecognized TLS
     // handshake, forward the connection transparently instead of dropping it.
