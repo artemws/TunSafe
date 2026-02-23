@@ -184,12 +184,14 @@ bool WgFileParser::ParseFlag(const char *group, const char *key, char *value) {
       int v = 1;
       if (ParseBoolean(value, &flag)) {
         v = flag;
-      } else if (strcmp(value, "tls-firefox") == 0) {
+      } else if (strcmp(value, "tls") == 0 ||
+                 strcmp(value, "tls-chrome") == 0 ||
+                 strcmp(value, "tls-firefox") == 0) {
+        // tls-chrome and tls-firefox are kept for config compatibility;
+        // both map to the single TLS obfuscation mode.
         v = 2;
-      } else if (strcmp(value, "tls-chrome") == 0) {
-        v = 3;
       } else if (*value != 0) {
-        RERROR("Unknown mode in ObfuscateTCP: %s", value);
+        RERROR("Unknown mode in ObfuscateTCP: %s (valid: true, tls)", value);
       }
       wg_->dev().packet_obfuscator().set_obfuscate_tcp(v);
 
@@ -540,5 +542,3 @@ getout_fail:
   (*result) = "errno=1\n\n";
   return false;
 }
-
-
