@@ -71,6 +71,17 @@ public:
   uint32 size() const { return rqueue_bytes_; }
  
   SimplePacketPool *pool() { return pool_; }
+
+  // Transfer all buffered data to caller; queue becomes empty.
+  void Steal(Packet **head, Packet ***tail, uint32 *bytes) {
+    *head  = rqueue_;
+    *tail  = rqueue_end_;
+    *bytes = rqueue_bytes_;
+    rqueue_ = NULL;
+    rqueue_end_ = &rqueue_;
+    rqueue_bytes_ = 0;
+  }
+
 private:
   // Total # of bytes queued
   uint rqueue_bytes_;
@@ -104,6 +115,12 @@ public:
   // Add a new chunk of incoming data to the packet list
   void QueueIncomingPacket(Packet *p) {
     queue_.Add(p);
+  }
+
+  // Steal the raw unprocessed byte queue (for proxy fallback).
+  // After this call the queue is empty and ownership passes to caller.
+  void StealRawQueue(Packet **head, Packet ***tail, uint32 *bytes) {
+    queue_.Steal(head, tail, bytes);
   }
 
   // Attempt to extract the next packet, returns NULL when complete.
