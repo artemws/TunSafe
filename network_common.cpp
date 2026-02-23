@@ -124,6 +124,7 @@ uint TcpPacketQueue::PeekUint16() {
 
 TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfuscator *obfuscator, bool is_incoming)
    : queue_(packet_pool),
+     raw_replay_(packet_pool),
      tls_queue_(packet_pool),
      write_state_(is_incoming),
      obfuscation_mode_(kObfuscationMode_None) {
@@ -148,6 +149,7 @@ TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfusc
   error_flag_ = false;
   real_tls_detected_ = false;
   plaintext_detected_ = false;
+  replay_done_ = false;
   decryptor_initialized_ = false;
   predicted_key_in_ = predicted_key_out_ = 0;
   predicted_serial_in_ = predicted_serial_out_ = 0;
