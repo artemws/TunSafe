@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/uio.h>
@@ -1026,8 +1027,48 @@ void TcpSocketBsd::DoRead() {
     processor_->HandleUdpPacket(p, network_->overload_);
   }
 
-  if (tcp_packet_handler_.error() || bytes_read_org == 0)
+  if (tcp_packet_handler_.error() || bytes_read_org == 0) {
+    // If a proxy target is configured and the client sent an unrecognized TLS
+    // handshake, forward the connection transparently instead of dropping it.
+    const std::string &dom = processor_->proxy_domain();
+    if (tcp_packet_handler_.error() && !dom.empty() && processor_->proxy_port() != 0) {
+      // Resolve the upstream host synchronously (done once at this point).
+      struct addrinfo hints = {}, *ai = NULL;
+      hints.ai_family   = AF_UNSPEC;
+      hints.ai_socktype = SOCK_STREAM;
+      char portstr[8];
+      snprintf(portstr, sizeof(portstr), "%u", (unsigned)processor_->proxy_port());
+      int rc = getaddrinfo(dom.c_str(), portstr, &hints, &ai);
+      if (rc == 0 && ai) {
+        int rfd = socket(ai->ai_family, SOCK_STREAM, 0);
+        if (rfd >= 0) {
+          fcntl(rfd, F_SETFD, FD_CLOEXEC);
+          fcntl(rfd, F_SETFL, O_NONBLOCK);
+          connect(rfd, ai->ai_addr, (socklen_t)ai->ai_addrlen); // non-blocking: EINPROGRESS ok
+          // Steal buffered client bytes (the original ClientHello etc.)
+          Packet *buf_head = NULL;
+          Packet **buf_tail = &buf_head;
+          uint32 buf_bytes = 0;
+          tcp_packet_handler_.StealRawQueue(&buf_head, &buf_tail, &buf_bytes);
+          // Steal the client fd from this socket without closing it
+          int cfd = StealFd();
+          RINFO("TcpProxy: forwarding unrecognized TLS to %s:%u (%u buffered bytes)",
+                dom.c_str(), (unsigned)processor_->proxy_port(), buf_bytes);
+          freeaddrinfo(ai);
+          // TcpProxySocketBsd takes ownership of both fds and the buffered packets
+          new TcpProxySocketBsd(net, cfd, rfd, buf_head, buf_tail, buf_bytes);
+          // Destroy *this* (fd_ already stolen, so CloseSocket won't double-close)
+          delete this;
+          return;
+        }
+        freeaddrinfo(ai);
+      } else {
+        RERROR("TcpProxy: failed to resolve %s: %s", dom.c_str(),
+               rc ? gai_strerror(rc) : "no results");
+      }
+    }
     CloseSocketAndDestroy();
+  }
 }
 
 void TcpSocketBsd::DoWrite() {
@@ -1077,6 +1118,244 @@ void TcpSocketBsd::DoWrite() {
 
 void TcpSocketBsd::CloseSocketAndDestroy() {
   delete this;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// TcpProxySocketBsd - transparent byte-level proxy for unrecognized TLS clients
+//////////////////////////////////////////////////////////////////////////////////////////////
+
+TcpProxySocketBsd::TcpProxySocketBsd(NetworkBsd *net, int client_fd, int remote_fd,
+                                     Packet *buffered, Packet **buffered_end,
+                                     uint32 buffered_bytes)
+    : BaseSocketBsd(net),
+      remote_fd_(remote_fd),
+      remote_pollfd_slot_(-1),
+      to_remote_(buffered),
+      to_remote_end_(buffered_end ? buffered_end : &to_remote_),
+      to_remote_bytes_(buffered_bytes),
+      to_client_(NULL),
+      to_client_end_(&to_client_),
+      to_client_bytes_(0),
+      client_rd_open_(true),
+      client_wr_open_(true),
+      remote_rd_open_(true),
+      remote_wr_open_(true),
+      remote_connected_(false) {
+
+  // client socket uses the inherited BaseSocketBsd fd_
+  InitPollSlot(client_fd, POLLIN);
+
+  // remote socket needs its own poll slot
+  if (net->num_sock_ < net->max_sockets_) {
+    remote_pollfd_slot_ = net->num_sock_++;
+    net->pollfd_[remote_pollfd_slot_].fd = remote_fd;
+    net->pollfd_[remote_pollfd_slot_].events = POLLOUT | POLLIN;
+    net->pollfd_[remote_pollfd_slot_].revents = 0;
+    net->sockets_[remote_pollfd_slot_] = this;
+  } else {
+    RERROR("TcpProxySocketBsd: no free poll slot for remote fd");
+    CloseAll();
+  }
+}
+
+TcpProxySocketBsd::~TcpProxySocketBsd() {
+  // Free any queued packets
+  while (to_remote_) {
+    Packet *n = Packet_NEXT(to_remote_);
+    FreePacket(to_remote_);
+    to_remote_ = n;
+  }
+  while (to_client_) {
+    Packet *n = Packet_NEXT(to_client_);
+    FreePacket(to_client_);
+    to_client_ = n;
+  }
+  // Release the remote poll slot
+  if (remote_pollfd_slot_ >= 0) {
+    network_->pollfd_[remote_pollfd_slot_].fd = -1;
+    network_->sockets_[remote_pollfd_slot_] = NULL;
+    // compact if it was the last slot
+    if (remote_pollfd_slot_ == network_->num_sock_ - 1)
+      network_->num_sock_--;
+    remote_pollfd_slot_ = -1;
+  }
+  if (remote_fd_ >= 0) {
+    close(remote_fd_);
+    remote_fd_ = -1;
+  }
+}
+
+void TcpProxySocketBsd::CloseAll() {
+  delete this;
+}
+
+void TcpProxySocketBsd::EnqueueToRemote(Packet *p) {
+  p->queue_next = NULL;
+  *to_remote_end_ = p;
+  to_remote_end_ = &Packet_NEXT(p);
+  to_remote_bytes_ += p->size;
+}
+
+void TcpProxySocketBsd::EnqueueToClient(Packet *p) {
+  p->queue_next = NULL;
+  *to_client_end_ = p;
+  to_client_end_ = &Packet_NEXT(p);
+  to_client_bytes_ += p->size;
+}
+
+void TcpProxySocketBsd::DoClientRead() {
+  Packet *p = AllocPacket();
+  if (!p) return;
+  ssize_t n = read(fd_, p->data, kPacketCapacity);
+  if (n > 0) {
+    p->size = (int)n;
+    EnqueueToRemote(p);
+    // Try to flush immediately
+    if (remote_fd_ >= 0 && remote_connected_)
+      DoRemoteWrite();
+  } else {
+    FreePacket(p);
+    if (n == 0 || errno != EAGAIN) {
+      client_rd_open_ = false;
+      // Signal EOF to remote
+      if (remote_fd_ >= 0 && remote_connected_ && to_remote_bytes_ == 0)
+        shutdown(remote_fd_, SHUT_WR);
+      if (!client_rd_open_ && !client_wr_open_ && !remote_rd_open_ && !remote_wr_open_)
+        CloseAll();
+    }
+  }
+}
+
+void TcpProxySocketBsd::DoClientWrite() {
+  while (to_client_) {
+    ssize_t n = write(fd_, to_client_->data, to_client_->size);
+    if (n < 0) {
+      if (errno != EAGAIN) {
+        client_wr_open_ = false;
+        if (!client_rd_open_ && !client_wr_open_ && !remote_rd_open_ && !remote_wr_open_)
+          CloseAll();
+      } else {
+        SetPollFlags(POLLIN | POLLOUT);
+      }
+      return;
+    }
+    to_client_bytes_ -= n;
+    if (n < to_client_->size) {
+      to_client_->data += n;
+      to_client_->size -= n;
+      SetPollFlags(POLLIN | POLLOUT);
+      return;
+    }
+    Packet *next = Packet_NEXT(to_client_);
+    FreePacket(to_client_);
+    to_client_ = next;
+    if (!to_client_) to_client_end_ = &to_client_;
+  }
+  // All flushed
+  if (!remote_rd_open_) {
+    // Remote is gone, close client write side
+    shutdown(fd_, SHUT_WR);
+    client_wr_open_ = false;
+    if (!client_rd_open_ && !remote_rd_open_ && !remote_wr_open_)
+      CloseAll();
+  }
+}
+
+void TcpProxySocketBsd::DoRemoteRead() {
+  Packet *p = AllocPacket();
+  if (!p) return;
+  ssize_t n = read(remote_fd_, p->data, kPacketCapacity);
+  if (n > 0) {
+    p->size = (int)n;
+    EnqueueToClient(p);
+    DoClientWrite();
+  } else {
+    FreePacket(p);
+    if (n == 0 || errno != EAGAIN) {
+      remote_rd_open_ = false;
+      if (to_client_bytes_ == 0) {
+        shutdown(fd_, SHUT_WR);
+        client_wr_open_ = false;
+      }
+      if (!client_rd_open_ && !client_wr_open_ && !remote_rd_open_ && !remote_wr_open_)
+        CloseAll();
+    }
+  }
+}
+
+void TcpProxySocketBsd::DoRemoteWrite() {
+  while (to_remote_) {
+    ssize_t n = write(remote_fd_, to_remote_->data, to_remote_->size);
+    if (n < 0) {
+      if (errno != EAGAIN) {
+        remote_wr_open_ = false;
+        if (!client_rd_open_ && !client_wr_open_ && !remote_rd_open_ && !remote_wr_open_)
+          CloseAll();
+      } else {
+        // Update remote poll flags to wait for POLLOUT
+        network_->pollfd_[remote_pollfd_slot_].events = POLLIN | POLLOUT;
+      }
+      return;
+    }
+    to_remote_bytes_ -= n;
+    if (n < to_remote_->size) {
+      to_remote_->data += n;
+      to_remote_->size -= n;
+      network_->pollfd_[remote_pollfd_slot_].events = POLLIN | POLLOUT;
+      return;
+    }
+    Packet *next = Packet_NEXT(to_remote_);
+    FreePacket(to_remote_);
+    to_remote_ = next;
+    if (!to_remote_) to_remote_end_ = &to_remote_;
+  }
+  // All sent
+  network_->pollfd_[remote_pollfd_slot_].events = POLLIN;
+  if (!client_rd_open_) {
+    shutdown(remote_fd_, SHUT_WR);
+    remote_wr_open_ = false;
+    if (!client_rd_open_ && !client_wr_open_ && !remote_rd_open_ && !remote_wr_open_)
+      CloseAll();
+  }
+}
+
+void TcpProxySocketBsd::HandleEvents(int revents) {
+  // Determine if this event is for the client fd or the remote fd
+  bool is_remote = (network_->sockets_[remote_pollfd_slot_] == this &&
+                    remote_pollfd_slot_ >= 0 &&
+                    network_->pollfd_[remote_pollfd_slot_].revents != 0 &&
+                    pollfd_slot_ != remote_pollfd_slot_);
+
+  // We re-enter for both fds from the RunLoop; detect which one fired
+  // by checking which pollfd matches our revents.
+  // Simple approach: called once per event; check both.
+  int rrev = network_->pollfd_[remote_pollfd_slot_].revents;
+  int crev = network_->pollfd_[pollfd_slot_].revents;
+
+  if (!remote_connected_) {
+    if (rrev & (POLLOUT | POLLERR | POLLHUP)) {
+      int err = 0;
+      socklen_t len = sizeof(err);
+      getsockopt(remote_fd_, SOL_SOCKET, SO_ERROR, &err, &len);
+      if (err != 0) {
+        RERROR("TcpProxy: connect to upstream failed: %s", strerror(err));
+        CloseAll();
+        return;
+      }
+      remote_connected_ = true;
+      RINFO("TcpProxy: connected to upstream, replaying %u bytes", to_remote_bytes_);
+      DoRemoteWrite();
+    }
+    return;
+  }
+
+  if (rrev & POLLIN)  DoRemoteRead();
+  if (rrev & POLLOUT) DoRemoteWrite();
+  if (crev & POLLIN)  DoClientRead();
+  if (crev & POLLOUT) DoClientWrite();
+
+  // Clear processed revents
+  network_->pollfd_[remote_pollfd_slot_].revents = 0;
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////
