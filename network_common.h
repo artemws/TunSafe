@@ -111,13 +111,34 @@ public:
   // Adds a tcp header to a data packet so it can be transmitted on the wire
   void PrepareOutgoingPackets(Packet *p);
 
-  // Add a new chunk of incoming data to the packet list
+  // Add a new chunk of incoming data; mirrors into raw_replay_ until authenticated.
   void QueueIncomingPacket(Packet *p) {
+    if (!replay_done_) {
+      Packet *copy = raw_replay_.pool()->AllocPacketFromPool();
+      if (copy) {
+        memcpy(copy->data, p->data, p->size);
+        copy->size = p->size;
+        raw_replay_.Add(copy);
+      }
+    }
     queue_.Add(p);
   }
 
+  // Stop mirroring to replay buffer (call when WireGuard auth succeeds).
+  void ClearReplayBuffer() {
+    replay_done_ = true;
+    Packet *head = NULL; Packet **tail = &head; uint32 bytes = 0;
+    raw_replay_.Steal(&head, &tail, &bytes);
+    while (head) { Packet *n = Packet_NEXT(head); FreePacket(head); head = n; }
+  }
+
+  // Steal replay buffer — all raw bytes received before auth.
+  // Ownership passes to caller.
+  void StealReplayBuffer(Packet **head, Packet ***tail, uint32 *bytes) {
+    raw_replay_.Steal(head, tail, bytes);
+  }
+
   // Steal the raw unprocessed byte queue (for proxy fallback).
-  // After this call the queue is empty and ownership passes to caller.
   void StealRawQueue(Packet **head, Packet ***tail, uint32 *bytes) {
     queue_.Steal(head, tail, bytes);
   }
@@ -150,6 +171,7 @@ private:
   bool error_flag_;
   bool real_tls_detected_;   // incoming real TLS ClientHello seen
   bool plaintext_detected_;  // incoming plaintext (HTTP etc.) seen
+  bool replay_done_;         // stop mirroring to raw_replay_
   uint8 obfuscation_mode_;
   uint8 read_state_, write_state_, tls_read_state_;
   bool decryptor_initialized_;
@@ -160,6 +182,9 @@ private:
   uint tls_bytes_left_;
 
   TcpPacketQueue queue_;
+
+  // Mirror of all raw incoming bytes before authentication — used for proxy replay.
+  TcpPacketQueue raw_replay_;
 
   // There's a separate queue for tls since it unwraps stuff
   TcpPacketQueue tls_queue_;
