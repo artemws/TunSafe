@@ -2,8 +2,8 @@
 // Copyright (C) 2018 Ludvig Strigeus <info@tunsafe.com>. All Rights Reserved.
 #pragma once
 
-#define TUNSAFE_VERSION_STRING "TunSafe 1.6"
-#define TUNSAFE_VERSION_STRING_LONG "TunSafe 1.6"
+#define TUNSAFE_VERSION_STRING "TunSafe 1.6.1"
+#define TUNSAFE_VERSION_STRING_LONG "TunSafe 1.6.1"
 
 // Enable support for handshake extensions
 #define WITH_HANDSHAKE_EXT 1
