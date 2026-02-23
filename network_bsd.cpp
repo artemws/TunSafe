@@ -1035,7 +1035,7 @@ bool TcpSocketBsd::LaunchProxy() {
   Packet *buf_head = NULL;
   Packet **buf_tail = &buf_head;
   uint32 buf_bytes = 0;
-  tcp_packet_handler_.StealRawQueue(&buf_head, &buf_tail, &buf_bytes);
+  tcp_packet_handler_.StealReplayBuffer(&buf_head, &buf_tail, &buf_bytes);
 
   int cfd = StealFd();
   RINFO("TcpProxy: forwarding to %s:%u (%u buffered bytes)",
@@ -1085,6 +1085,7 @@ void TcpSocketBsd::DoRead() {
     p->addr = endpoint_;
     processor_->HandleUdpPacket(p, network_->overload_);
     proxy_timeout_ = 0;  // valid WireGuard data — disarm proxy timer
+    tcp_packet_handler_.ClearReplayBuffer();  // no longer need replay mirror
   }
 
   // First time we see a real TLS ClientHello (0x1603), arm the 3-second proxy timer.
