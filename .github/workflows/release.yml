@@ -46,8 +46,9 @@ jobs:
       - name: Patch wireguard.cpp (PacketResultd typo)
         run: |
           # GCC 13 rejects the typo 'PacketResultd' even inside #if WITH_SHORT_HEADERS=0.
+          # sed is idempotent - safe even if already fixed in the repo.
           sed -i 's/WireguardProcessor::PacketResultd/WireguardProcessor::PacketResult/g' wireguard.cpp
-          grep -n "PacketResult" wireguard.cpp | grep "710"
+          echo "wireguard.cpp line 710: $(sed -n '710p' wireguard.cpp)"
 
       - uses: actions/upload-artifact@v4
         with:
