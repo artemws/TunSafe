@@ -29,6 +29,7 @@ WireguardProcessor::WireguardProcessor(UdpInterface *udp, TunInterface *tun, Pro
   memset(&stats_, 0, sizeof(stats_));
   listen_port_ = 0;
   listen_port_tcp_ = 0;
+  proxy_port_ = 0;
   network_discovery_spoofing_ = false;
   add_routes_mode_ = true;
   dns_blocking_ = true;
@@ -58,6 +59,11 @@ void WireguardProcessor::SetListenPortTcp(int listen_port) {
       RINFO("ConfigureUdp failed");
     }
   }
+}
+
+void WireguardProcessor::SetTcpProxyTarget(const char *domain, int port) {
+  proxy_domain_ = domain ? domain : "";
+  proxy_port_ = (uint16)port;
 }
 
 
