@@ -147,11 +147,12 @@ public:
   Packet *GetNextWireguardPacket();
   
   bool error() const { return error_flag_; }
-  // True once autodetect has identified an incoming real TLS ClientHello (0x1603)
-  // but the connection has NOT been authenticated as a TunSafe peer yet.
   bool real_tls_detected() const { return real_tls_detected_; }
-  // True once autodetect has identified a non-TLS, non-WireGuard stream (HTTP etc.)
   bool plaintext_detected() const { return plaintext_detected_; }
+  // True once ClientHello was parsed and decryptor key derived from it.
+  bool client_hello_parsed() const { return decryptor_initialized_; }
+  // Bytes still buffered waiting to be parsed.
+  uint32 queue_size() const { return queue_.size(); }
 
 private:
   void PrepareOutgoingPacketsNormal(Packet *p);
