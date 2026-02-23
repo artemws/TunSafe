@@ -43,10 +43,18 @@ jobs:
             ip_to_peer_map.cpp
           grep -n "malloc(offsetof" ip_to_peer_map.cpp
 
+      - name: Patch wireguard.cpp (PacketResultd typo)
+        run: |
+          # GCC 13 rejects the typo 'PacketResultd' even inside #if WITH_SHORT_HEADERS=0.
+          sed -i 's/WireguardProcessor::PacketResultd/WireguardProcessor::PacketResult/g' wireguard.cpp
+          grep -n "PacketResult" wireguard.cpp | grep "710"
+
       - uses: actions/upload-artifact@v4
         with:
           name: patched-sources
-          path: ip_to_peer_map.cpp
+          path: |
+            ip_to_peer_map.cpp
+            wireguard.cpp
 
   # ─────────────────────────────────────────────────────────────────
   # Linux x86_64 — static + ASM
