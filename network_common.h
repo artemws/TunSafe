@@ -101,8 +101,7 @@ public:
     kObfuscationMode_Unspecified = -1,
     kObfuscationMode_None = 0,
     kObfuscationMode_Encrypted = 1,
-    kObfuscationMode_TlsFirefox = 2,
-    kObfuscationMode_TlsChrome = 3,
+    kObfuscationMode_Tls = 2,
     kObfuscationMode_Autodetect = 4,
   };
 
