@@ -669,7 +669,7 @@ public:
   virtual void RunAllMainThreadScheduled() override;
 
   // -- from ProcessorDelegate
-  virtual void OnConnected() override;
+  virtual void OnConnected(WgPeer *peer) override;
   virtual void OnConnectionRetry(uint32 attempts) override;
 
   // -- from PluginDelegate
@@ -695,16 +695,18 @@ private:
 TunsafeBackendBsdImpl::TunsafeBackendBsdImpl() 
     : is_connected_(false),
       close_orphan_counter_(0),
-      plugin_(nullptr),
+      plugin_(CreateTunsafePlugin(this, &processor_)),
       processor_(this, this, this),
       network_(this, 1000),
       tun_(&network_, &processor_), 
       udp_(&network_, &processor_),
       unix_socket_listener_(&network_, &processor_),
       tcp_socket_listener_(&network_, &processor_) {
+  processor_.dev().SetPlugin(plugin_);
 }
 
 TunsafeBackendBsdImpl::~TunsafeBackendBsdImpl() {
+  delete plugin_;
 }
 
 bool TunsafeBackendBsdImpl::InitializeTun(char devname[16]) {
@@ -758,15 +760,22 @@ void TunsafeBackendBsdImpl::RunAllMainThreadScheduled() {
   processor_.RunAllMainThreadScheduled();
 }
 
-void TunsafeBackendBsdImpl::OnConnected() {
+void TunsafeBackendBsdImpl::OnConnected(WgPeer *peer) {
   if (!is_connected_) {
     const WgCidrAddr *ipv4_addr = NULL;
     for (const WgCidrAddr &x : processor_.addr()) {
       if (x.size == 32) { ipv4_addr = &x; break; }
     }
     uint32 ipv4_ip = ipv4_addr ? ReadBE32(ipv4_addr->addr) : 0;
-    char buf[kSizeOfAddress];
-    RINFO("Connection established. IP %s", ipv4_ip ? print_ip(buf, ipv4_ip) : "(none)");
+    char buf[kSizeOfAddress], peer_buf[kSizeOfAddress];
+    const char *peer_str = "(unknown)";
+    if (peer) {
+      const IpAddr &ep = peer->endpoint();
+      if (ep.sin.sin_family != 0)
+        peer_str = PrintIpAddr(ep, peer_buf);
+    }
+    RINFO("Connection established. IP %s, peer %s",
+          ipv4_ip ? print_ip(buf, ipv4_ip) : "(none)", peer_str);
     is_connected_ = true;
   }
 }
@@ -860,4 +869,3 @@ int main(int argc, char **argv) {
 
   return 0;
 }
-
