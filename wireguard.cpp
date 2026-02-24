@@ -828,7 +828,7 @@ getout:
 }
 #endif  // WITH_SHORT_HEADERS
 
-void WireguardProcessor::NotifyHandshakeComplete() {
+void WireguardProcessor::NotifyHandshakeComplete(WgPeer *peer) {
   uint64 now = OsGetMilliseconds();
   
   // todo: should lock something
@@ -837,7 +837,7 @@ void WireguardProcessor::NotifyHandshakeComplete() {
     stats_.first_complete_handshake_timestamp = now;
 
   if (procdel_)
-    procdel_->OnConnected();
+    procdel_->OnConnected(peer);
 }
 
 WireguardProcessor::PacketResult WireguardProcessor::HandleAuthenticatedDataPacket_WillUnlock(WgKeypair *keypair, Packet *packet, uint data_size) {
@@ -875,7 +875,7 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleAuthenticatedDataPack
   if (peer->CheckSwitchToNextKey_Locked(keypair)) {
     stats_.handshakes_in_success++;
     peer->OnHandshakeFullyComplete();
-    NotifyHandshakeComplete();
+    NotifyHandshakeComplete(peer);
     SendQueuedPackets_Locked(peer);
   }
 
@@ -1066,7 +1066,7 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleHandshakeResponsePack
     WG_SCOPED_LOCK(peer->mutex_);
     peer->OnHandshakeAuthComplete();
     peer->OnHandshakeFullyComplete();
-    NotifyHandshakeComplete();
+    NotifyHandshakeComplete(peer);
     SendKeepalive_Locked(peer);
   } else {
     stats_.invalid_packets_in++;
