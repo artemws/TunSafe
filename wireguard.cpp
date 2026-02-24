@@ -635,8 +635,15 @@ void WireguardProcessor::SendHandshakeInitiation(WgPeer *peer) {
     if (procdel_)
       procdel_->OnConnectionRetry(peer, attempts);
     peer->OnHandshakeInitSent();
-    packet->addr = peer->endpoint_;
-    packet->protocol = peer->endpoint_protocol_;
+    // If a separate TCP endpoint is configured (EndpointTCP), send the
+    // handshake via TCP regardless of the UDP endpoint protocol.
+    if (peer->tcp_endpoint().sin.sin_family != 0) {
+      packet->addr     = peer->tcp_endpoint();
+      packet->protocol = kPacketProtocolTcp;
+    } else {
+      packet->addr     = peer->endpoint_;
+      packet->protocol = peer->endpoint_protocol_;
+    }
     WG_EXTENSION_HOOKS::OnPeerOutgoingUdp(peer, packet);
     peer->tx_bytes_ += packet->size;
 
