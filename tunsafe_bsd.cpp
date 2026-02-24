@@ -761,22 +761,25 @@ void TunsafeBackendBsdImpl::RunAllMainThreadScheduled() {
 }
 
 void TunsafeBackendBsdImpl::OnConnected(WgPeer *peer) {
+  char buf[kSizeOfAddress], peer_buf[kSizeOfAddress];
+  const char *peer_str = "(unknown)";
+  if (peer) {
+    const IpAddr &ep = peer->endpoint();
+    if (ep.sin.sin_family != 0)
+      peer_str = PrintIpAddr(ep, peer_buf);
+  }
+
   if (!is_connected_) {
     const WgCidrAddr *ipv4_addr = NULL;
     for (const WgCidrAddr &x : processor_.addr()) {
       if (x.size == 32) { ipv4_addr = &x; break; }
     }
     uint32 ipv4_ip = ipv4_addr ? ReadBE32(ipv4_addr->addr) : 0;
-    char buf[kSizeOfAddress], peer_buf[kSizeOfAddress];
-    const char *peer_str = "(unknown)";
-    if (peer) {
-      const IpAddr &ep = peer->endpoint();
-      if (ep.sin.sin_family != 0)
-        peer_str = PrintIpAddr(ep, peer_buf);
-    }
     RINFO("Connection established. IP %s, peer %s",
           ipv4_ip ? print_ip(buf, ipv4_ip) : "(none)", peer_str);
     is_connected_ = true;
+  } else {
+    RINFO("Peer connected: %s", peer_str);
   }
 }
 
