@@ -278,6 +278,7 @@ public:
   // -- from UdpInterface
   virtual bool Configure(int listen_port_udp, int listen_port_tcp) override;
   virtual void WriteUdpPacket(Packet *packet) override;
+  virtual void CloseOutgoingTcpForAddr(const IpAddr &addr) override;
 
   virtual void OnConnected(WgPeer *peer) override;
   virtual void OnConnectionRetry(WgPeer *peer, uint32 attempts) override;
