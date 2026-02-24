@@ -796,6 +796,17 @@ void NetworkWin32::PostQueuedItem(QueuedItem *item) {
   PostQueuedCompletionStatus(completion_port_handle_, NULL, NULL, &item->overlapped);
 }
 
+void NetworkWin32::CloseOutgoingTcpForAddr(const IpAddr &addr) {
+  // Has friend access to TcpSocketWin32 private members.
+  for (TcpSocketWin32 *tcp = tcp_socket_; tcp; tcp = tcp->next_) {
+    if (tcp->endpoint_protocol_ == kPacketProtocolTcp &&
+        CompareIpAddr(&tcp->endpoint_, &addr) == 0) {
+      tcp->CloseSocket();
+      return;
+    }
+  }
+}
+
 /////////////////////////////////////////////////////////////////////////
 
 PacketProcessor::PacketProcessor() {
@@ -1921,13 +1932,7 @@ void TunsafeRunner::WriteUdpPacket(Packet *packet) {
 void TunsafeRunner::CloseOutgoingTcpForAddr(const IpAddr &addr) {
   char buf[kSizeOfAddress];
   RINFO("hybrid_tcp: closing TCP socket to %s after handshake complete", PrintIpAddr(addr, buf));
-  for (TcpSocketWin32 *tcp = net_.tcp_socket_; tcp; tcp = tcp->next_) {
-    if (tcp->endpoint_protocol_ == kPacketProtocolTcp &&
-        CompareIpAddr(&tcp->endpoint_, &addr) == 0) {
-      tcp->CloseSocket();
-      return;
-    }
-  }
+  net_.CloseOutgoingTcpForAddr(addr);
 }
 
 void TunsafeRunner::OnConnected(WgPeer *peer) {
