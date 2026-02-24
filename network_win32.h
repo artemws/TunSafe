@@ -279,7 +279,7 @@ public:
   virtual bool Configure(int listen_port_udp, int listen_port_tcp) override;
   virtual void WriteUdpPacket(Packet *packet) override;
 
-  virtual void OnConnected() override;
+  virtual void OnConnected(WgPeer *peer) override;
   virtual void OnConnectionRetry(uint32 attempts) override;
 
   // -- from PluginDelegate
@@ -466,4 +466,3 @@ private:
 static inline void ClearOverlapped(OVERLAPPED *o) {
   memset(o, 0, sizeof(*o));
 }
-
