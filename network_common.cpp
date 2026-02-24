@@ -608,12 +608,12 @@ Packet *TcpPacketHandler::GetNextWireguardPacketNormal() {
   while (queue_.size() >= 2) {
     uint32 packet_header = queue_.PeekUint16();
     uint32 packet_size = packet_header & 0x7FFF;
-    if (packet_size + 2 > kPacketCapacity) {
+    if ((uint32)packet_size + 2 > (uint32)kPacketCapacity) {
 error:
       error_flag_ = true;
       return NULL;
     }
-    if (packet_size + 2 > queue_.size())
+    if ((uint32)packet_size + 2 > queue_.size())
       return NULL;
     Packet *packet = queue_.Read(packet_size + 2);
     if (!packet)
