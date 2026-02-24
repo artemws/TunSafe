@@ -1167,6 +1167,8 @@ void WgPeer::OnHandshakeFullyComplete() {
   total_handshake_attempts_ = handshake_attempts_ = 0;
 
   uint64 now = OsGetMilliseconds();
+  char buf[kSizeOfAddress];
+  const char *peer_str = endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, buf) : "(unknown)";
 
   if (last_complete_handskake_timestamp_ == 0) {
     bool any_feature = false;
@@ -1181,9 +1183,10 @@ void WgPeer::OnHandshakeFullyComplete() {
             curr_keypair_->enabled_features[WG_FEATURE_ID_SKIP_KEYID_OUT] ? ", skip_keyid_out" : "",
             curr_keypair_->enabled_features[WG_FEATURE_HYBRID_TCP] ? ", hybrid_tcp" : "");
     }
+  } else {
+    RINFO("Handshake complete for peer %s", peer_str);
   }
   last_complete_handskake_timestamp_ = now;
-//  RINFO("Connection established.");
 }
 
 // Check if any of the timeouts have expired
@@ -1249,7 +1252,9 @@ uint32 WgPeer::CheckTimeouts_Locked(uint64 now) {
       }
     }
     if ((t & (1 << TIMER_ZERO_KEYS)) && (now32 - timer_value_[TIMER_ZERO_KEYS]) >= REJECT_AFTER_TIME_MS * 3) {
-      RINFO("Expiring all keys for peer");
+      char buf[kSizeOfAddress];
+      RINFO("Expiring all keys for peer %s",
+            endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, buf) : "(unknown)");
       t &= ~(1 << TIMER_ZERO_KEYS);
       ClearKeys_Locked();
       ClearHandshake_Locked();
