@@ -124,6 +124,7 @@ uint TcpPacketQueue::PeekUint16() {
 
 TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfuscator *obfuscator, bool is_incoming)
    : queue_(packet_pool),
+     raw_replay_(packet_pool),
      tls_queue_(packet_pool),
      write_state_(is_incoming),
      obfuscation_mode_(kObfuscationMode_None) {
@@ -131,14 +132,24 @@ TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfusc
   if (obfuscator->enabled() && obfuscator->obfuscate_tcp() != TcpPacketHandler::kObfuscationMode_None) {
     memcpy(encryptor_.buf, obfuscator->key(), CHACHA20POLY1305_KEYLEN);
     memcpy(decryptor_.buf, obfuscator->key(), CHACHA20POLY1305_KEYLEN);
-    obfuscation_mode_ = obfuscator->obfuscate_tcp() != TcpPacketHandler::kObfuscationMode_Unspecified ? obfuscator->obfuscate_tcp() :
-        (is_incoming ? TcpPacketHandler::kObfuscationMode_Autodetect : TcpPacketHandler::kObfuscationMode_Encrypted);
+    if (is_incoming) {
+      // Server must always autodetect: it doesn't know whether the incoming
+      // connection is a TunSafe client, a real browser (TLS), or plaintext HTTP.
+      obfuscation_mode_ = kObfuscationMode_Autodetect;
+    } else {
+      obfuscation_mode_ = obfuscator->obfuscate_tcp() != TcpPacketHandler::kObfuscationMode_Unspecified
+          ? obfuscator->obfuscate_tcp()
+          : kObfuscationMode_Encrypted;
+    }
     read_state_ = (obfuscation_mode_ == kObfuscationMode_Encrypted) ? READ_CRYPTO_HEADER : READ_PACKET_HEADER;
   } else if (!obfuscator->enabled() && obfuscator->obfuscate_tcp() > TcpPacketHandler::kObfuscationMode_None) {
     RERROR("No ObfuscateKey specified. Disabling TCP obfuscation.");
   }
   tls_read_state_ = 0;
   error_flag_ = false;
+  real_tls_detected_ = false;
+  plaintext_detected_ = false;
+  replay_done_ = false;
   decryptor_initialized_ = false;
   predicted_key_in_ = predicted_key_out_ = 0;
   predicted_serial_in_ = predicted_serial_out_ = 0;
@@ -160,181 +171,224 @@ static void SetChachaStreamingKey(chacha20_streaming *chacha, const uint8 *key, 
   chacha20_streaming_init(chacha, chacha->buf);
 }
 
+// ---------------------------------------------------------------------------
+// CreateTls13ClientHello — multi-profile JA3 randomization
+//
+// Each connection randomly picks one of several real Chrome/Edge fingerprints.
+// The extensions are written in the exact order observed in that browser version
+// so the resulting JA3 hash matches a known-good browser fingerprint.
+//
+// Rules that must always hold (RFC 8446):
+//   • pre_shared_key MUST be the very last extension
+//   • GREASE values are regenerated randomly per connection (0xXAXA pattern)
+//   • Random/session-id fields are always fresh random bytes
+// ---------------------------------------------------------------------------
 size_t TcpPacketHandler::CreateTls13ClientHello(uint8 *dst) {
   uint8 *dst_org = dst;
-  // handshake, tls 1.0
-  *dst++ = 0x16;
-  *dst++ = 0x03;
-  *dst++ = 0x01;
-  uint8 *handshake_length = postinc(dst, 2);
-  // handshake client hello
-  *dst++ = 0x01;
-  *dst++ = 0x00;
-  uint8 *handshake_inner_length = postinc(dst, 2);
-  // version = tls 1.2
-  *dst++ = 0x03;
-  *dst++ = 0x03;
-  // 32 byte random
-  OsGetRandomBytes(postinc(dst, 32), 32);
-  *dst++ = 0x20;   // Session length = 32
-  // 32 byte session id
-  OsGetRandomBytes(postinc(dst, 32), 32);
 
-  bool firefox = (obfuscation_mode_ == kObfuscationMode_TlsFirefox);
-
-  if (firefox) {
-    static const uint8 tls_header1[] = {
-      // 18 cipher suites
-      0x00, 0x24,
-      0x13, 0x01, 0x13, 0x03, 0x13, 0x02, 0xc0, 0x2b, 0xc0, 0x2f, 0xcc, 0xa9, 0xcc, 0xa8, 0xc0, 0x2c, 0xc0, 0x30,
-      0xc0, 0x0a, 0xc0, 0x09, 0xc0, 0x13, 0xc0, 0x14, 0x00, 0x33, 0x00, 0x39, 0x00, 0x2f, 0x00, 0x35, 0x00, 0x0a,
-      // compression method = null
-      0x01, 0x00,
-    };
-    memcpy(postinc(dst, sizeof(tls_header1)), tls_header1, sizeof(tls_header1));
-  } else {
-    static const uint8 tls_header1_chrome[] = {
-      // 17 cipher suites
-      0x00, 0x22,
-      0xda, 0xda, 0x13, 0x01, 0x13, 0x02, 0x13, 0x03, 0xc0, 0x2b, 0xc0, 0x2f, 0xc0, 0x2c, 0xc0, 0x30, 0xcc, 0xa9,
-      0xcc, 0xa8, 0xc0, 0x13, 0xc0, 0x14, 0x00, 0x9c, 0x00, 0x9d, 0x00, 0x2f, 0x00, 0x35, 0x00, 0x0a,
-      // compression method = null
-      0x01, 0x00,
-    };
-    memcpy(postinc(dst, sizeof(tls_header1_chrome)), tls_header1_chrome, sizeof(tls_header1_chrome));
-
-  }
-  uint8 *extensions_length = postinc(dst, 2);
-
-  if (!firefox) {
-    static const uint8 tls_header_grease[] = { 0xaa, 0xaa, 0x00, 0x00 };
-    memcpy(postinc(dst, sizeof(tls_header_grease)), tls_header_grease, sizeof(tls_header_grease));
-  }
-
-  static const uint8 tls_header2[] = {
-    // extension server name
-    0x00, 0x00, 0x00, 0x16, 0x00, 0x14, 0x00, 0x00, 0x11, 0x65, 0x6e, 0x61, 0x62, 0x6c, 0x65, 0x64, 0x2e, 0x74, 0x6c, 0x73, 0x31, 0x33, 0x2e, 0x63, 0x6f, 0x6d,
-    // extension master secret
-    0x00, 0x17, 0x00, 0x00,
-    // extension renegotiation info
-    0xff, 0x01, 0x00, 0x01, 0x00,
+  // Helper to write a single random GREASE byte pair (0xXA pattern)
+  auto grease_byte = [&]() -> uint8 {
+    uint8 b; OsGetRandomBytes(&b, 1);
+    return (b & 0xf0) | 0x0a;
   };
-  memcpy(postinc(dst, sizeof(tls_header2)), tls_header2, sizeof(tls_header2));
 
-  if (firefox) {
-    static const uint8 tls_header_groups_ff[] = {
-      // extension supported groups
-      0x00, 0x0a, 0x00, 0x0e, 0x00, 0x0c,
-      0x00, 0x1d, 0x00, 0x17, 0x00, 0x18, 0x00, 0x19, 0x01, 0x00, 0x01, 0x01,
-      // extension ec_point_formats
-      0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,
-      // extension application_layer_protocol_negotiation
-      0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31,
-      // extension status request
-      0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
-      // extension key share
-      0x00, 0x33, 0x00, 0x6b, 0x00, 0x69,
-      // key share x25519
-      0x00, 0x1d, 0x00, 0x20,
-    };
-    memcpy(postinc(dst, sizeof(tls_header_groups_ff)), tls_header_groups_ff, sizeof(tls_header_groups_ff));
-    // Firefox has a secp251p1 key while chrome does not
-    OsGetRandomBytes(postinc(dst, 32), 32);
-    dst[-1] &= 0x7f; // clear top bit of x25519 key
-    static const uint8 tls_header3[] = {
-      // key share secp256p1
-      0x00, 0x17, 0x00, 0x41,
-      0x04,
-    };
-    memcpy(postinc(dst, sizeof(tls_header3)), tls_header3, sizeof(tls_header3));
-    // todo: validate the secp256p1 key
-    OsGetRandomBytes(postinc(dst, 64), 64);
+  // ── TLS record header (Handshake, legacy TLS 1.0) ──────────────────────
+  *dst++ = 0x16; *dst++ = 0x03; *dst++ = 0x01;
+  uint8 *rec_len   = postinc(dst, 2);
+  *dst++ = 0x01; *dst++ = 0x00;                   // HandshakeType = ClientHello
+  uint8 *msg_len   = postinc(dst, 2);
+  *dst++ = 0x03; *dst++ = 0x03;                   // legacy_version = TLS 1.2
+  OsGetRandomBytes(postinc(dst, 32), 32);          // random (32 bytes)
+  *dst++ = 0x20;                                   // session_id length = 32
+  OsGetRandomBytes(postinc(dst, 32), 32);          // session_id
 
-    static const uint8 tls_header4[] = {
-      // extension early data (seems to be sent only in resume)
-      0x00, 0x2a, 0x00, 0x00,
-      // extension supported versions
-      0x00, 0x2b, 0x00, 0x09, 0x08, 0x03, 0x04, 0x03, 0x03, 0x03, 0x02, 0x03, 0x01,
-      // extension signature_algorithms
-      0x00, 0x0d, 0x00, 0x18, 0x00, 0x16, 0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x04, 0x08, 0x05, 0x08, 0x06, 0x04, 0x01, 0x05, 0x01, 0x06, 0x01, 0x02, 0x03, 0x02, 0x01,
-      // extension psk_key_exchange_modes
-      0x00, 0x2d, 0x00, 0x02, 0x01, 0x01,
-      // extension unknown type 28
-      0x00, 0x1c, 0x00, 0x02, 0x40, 0x01,
-      // extension pre shared key length=235
-      0x00, 0x29, 0x00, 0xeb,
-      // identities length=198, psk identity length = 192
-      0x00, 0xc6, 0x00, 0xc0,
-    };
-    memcpy(postinc(dst, sizeof(tls_header4)), tls_header4, sizeof(tls_header4));
+  // ── Choose browser profile randomly ────────────────────────────────────
+  // 0 = Chrome 120 / Edge 120   (compress_certificate present, no delegated_creds)
+  // 1 = Chrome 117              (same structure, slightly different GREASE positions)
+  // 2 = Chrome 124+             (adds encrypted_client_hello hint ext)
+  // 3 = Edge 118                (missing compress_certificate)
+  uint8 profile_rng; OsGetRandomBytes(&profile_rng, 1);
+  int profile = profile_rng & 3;  // 0-3
 
+  // ── Cipher suites ──────────────────────────────────────────────────────
+  // All profiles share the same suite list; only GREASE prefix differs.
+  uint8 g_cs = grease_byte();
+  static const uint8 suites[] = {
+    0x13,0x01, 0x13,0x02, 0x13,0x03,              // AES-128-GCM, AES-256-GCM, CHACHA20
+    0xc0,0x2b, 0xc0,0x2f,                          // ECDHE-ECDSA/RSA AES-128-GCM
+    0xc0,0x2c, 0xc0,0x30,                          // ECDHE-ECDSA/RSA AES-256-GCM
+    0xcc,0xa9, 0xcc,0xa8,                          // ECDHE-ECDSA/RSA CHACHA20
+    0xc0,0x13, 0xc0,0x14,                          // ECDHE-RSA AES-128/256-CBC
+    0x00,0x9c, 0x00,0x9d,                          // RSA AES-128/256-GCM
+    0x00,0x2f, 0x00,0x35, 0x00,0x0a,              // RSA AES/3DES
+  };
+  uint16_t suite_len = 2 + sizeof(suites);         // +2 for the GREASE entry
+  *dst++ = (uint8)(suite_len >> 8);
+  *dst++ = (uint8)(suite_len);
+  *dst++ = g_cs; *dst++ = g_cs;                   // GREASE cipher suite
+  memcpy(postinc(dst, sizeof(suites)), suites, sizeof(suites));
+  *dst++ = 0x01; *dst++ = 0x00;                   // compression: null only
+
+  // ── Extensions ─────────────────────────────────────────────────────────
+  uint8 *ext_len_ptr = postinc(dst, 2);
+
+  // Macro helpers to write a raw blob
+#define WEXT(blob) memcpy(postinc(dst, sizeof(blob)), (blob), sizeof(blob))
+
+  // -- Randomised GREASE leading extension (present in all profiles) -------
+  uint8 g_ext1 = grease_byte();
+  *dst++=g_ext1; *dst++=g_ext1; *dst++=0x00; *dst++=0x00;
+
+  // -- server_name (SNI, 0x0000) – always first real ext -------------------
+  static const uint8 sni[] = {
+    0x00,0x00, 0x00,0x16, 0x00,0x14, 0x00,0x00,0x11,
+    // "enabled.tls13.com"
+    0x65,0x6e,0x61,0x62,0x6c,0x65,0x64,0x2e,
+    0x74,0x6c,0x73,0x31,0x33,0x2e,0x63,0x6f,0x6d,
+  };
+  WEXT(sni);
+
+  // -- extended_master_secret (0x0017) -------------------------------------
+  static const uint8 ems[] = { 0x00,0x17, 0x00,0x00 };
+  WEXT(ems);
+
+  // -- renegotiation_info (0xff01) -----------------------------------------
+  static const uint8 ri[] = { 0xff,0x01, 0x00,0x01, 0x00 };
+  WEXT(ri);
+
+  // -- supported_groups (0x000a) with GREASE entry -------------------------
+  uint8 g_grp = grease_byte();
+  static const uint8 groups_tail[] = {
+    0x00,0x1d,  // x25519
+    0x00,0x17,  // secp256r1
+    0x00,0x18,  // secp384r1
+  };
+  uint16_t grp_inner = 2 + sizeof(groups_tail);
+  uint16_t grp_outer = 2 + grp_inner;
+  *dst++=0x00; *dst++=0x0a;
+  *dst++=(uint8)(grp_outer>>8); *dst++=(uint8)grp_outer;
+  *dst++=(uint8)(grp_inner>>8); *dst++=(uint8)grp_inner;
+  *dst++=g_grp; *dst++=g_grp;
+  memcpy(postinc(dst, sizeof(groups_tail)), groups_tail, sizeof(groups_tail));
+
+  // -- ec_point_formats (0x000b) -------------------------------------------
+  static const uint8 epf[] = { 0x00,0x0b, 0x00,0x02, 0x01,0x00 };
+  WEXT(epf);
+
+  // -- session_ticket (0x0023) ---------------------------------------------
+  static const uint8 st[] = { 0x00,0x23, 0x00,0x00 };
+  WEXT(st);
+
+  // -- application_layer_protocol_negotiation (0x0010) ---------------------
+  static const uint8 alpn[] = {
+    0x00,0x10, 0x00,0x0e, 0x00,0x0c,
+    0x02,0x68,0x32,                             // "h2"
+    0x08,0x68,0x74,0x74,0x70,0x2f,0x31,0x2e,0x31,  // "http/1.1"
+  };
+  WEXT(alpn);
+
+  // -- status_request (0x0005) ---------------------------------------------
+  static const uint8 sr[] = { 0x00,0x05, 0x00,0x05, 0x01,0x00,0x00,0x00,0x00 };
+  WEXT(sr);
+
+  // -- signature_algorithms (0x000d) – profile-dependent list -------------
+  if (profile <= 1) {
+    // Chrome 117-120
+    static const uint8 sa[] = {
+      0x00,0x0d, 0x00,0x14, 0x00,0x12,
+      0x04,0x03, 0x08,0x04, 0x04,0x01,
+      0x05,0x03, 0x08,0x05, 0x05,0x01,
+      0x08,0x06, 0x06,0x01, 0x02,0x01,
+    };
+    WEXT(sa);
   } else {
-    static const uint8 tls_header_groups_chrome[] = {
-      // extension supported groups
-      0x00, 0x0a, 0x00, 0x0a, 0x00, 0x08, 0x2a, 0x2a, 0x00, 0x1d, 0x00, 0x17, 0x00, 0x18,
-      // extension ec_point_formats
-      0x00, 0x0b, 0x00, 0x02, 0x01, 0x00,
-      // extension sessionticket tls
-      0x00, 0x23, 0x00, 0x00,
-      // extension application_layer_protocol_negotiation
-      0x00, 0x10, 0x00, 0x0e, 0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31,
-      // extension status request
-      0x00, 0x05, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00,
-      // extension signature_algorithms
-      0x00, 0x0d, 0x00, 0x14, 0x00, 0x12, 0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x08, 0x05, 0x05, 0x01, 0x08, 0x06, 0x06, 0x01, 0x02, 0x01,
-      // extension signed_certificate_timestamp
-      0x00, 0x12, 0x00, 0x00,
-      // extension key_share
-      0x00, 0x33, 0x00, 0x2b, 0x00, 0x29, 
-      0x2a, 0x2a, 0x00, 0x01, 0x00,
-      0x00, 0x1d, 0x00, 0x20,
+    // Chrome 124+ / Edge 118 – adds rsa_pss_rsae_sha512 (0x0806)
+    static const uint8 sa[] = {
+      0x00,0x0d, 0x00,0x16, 0x00,0x14,
+      0x04,0x03, 0x08,0x04, 0x04,0x01,
+      0x05,0x03, 0x08,0x05, 0x05,0x01,
+      0x08,0x06, 0x08,0x06, 0x06,0x01, 0x02,0x01,
     };
-    memcpy(postinc(dst, sizeof(tls_header_groups_chrome)), tls_header_groups_chrome, sizeof(tls_header_groups_chrome));
-    OsGetRandomBytes(postinc(dst, 32), 32);
-    dst[-1] &= 0x7f; // clear top bit of x25519 key
-
-    static const uint8 tls_header4_chrome[] = {
-      // extension psk_key_exchange_modes
-      0x00, 0x2d, 0x00, 0x02, 0x01, 0x01,
-      // extension supported versions
-      0x00, 0x2b, 0x00, 0x0b, 0x0a, 0x1a, 0x1a, 0x03, 0x04, 0x03, 0x03, 0x03, 0x02, 0x03, 0x01,
-      // extension unknown type 27
-      0x00, 0x1b, 0x00, 0x03, 0x02, 0x00, 0x02,
-      // extension reserved (grease)
-      0xea, 0xea, 0x00, 0x01, 0x00,
-      // extension pre shared key length=235
-      0x00, 0x29, 0x00, 0xeb,
-      // identities length=198, psk identity length = 192
-      0x00, 0xc6, 0x00, 0xc0,
-    };
-    memcpy(postinc(dst, sizeof(tls_header4_chrome)), tls_header4_chrome, sizeof(tls_header4_chrome));
+    WEXT(sa);
   }
 
-  OsGetRandomBytes(postinc(dst, 192 + 4), 192 + 4);
-  static const uint8 tls_header5[] = {
-    // psk binders length
-    0x00, 0x21,
-  };
-  memcpy(postinc(dst, sizeof(tls_header5)), tls_header5, sizeof(tls_header5));
-  OsGetRandomBytes(postinc(dst, 33), 33);
+  // -- signed_certificate_timestamp (0x0012) – profiles 0,1,2 only --------
+  if (profile != 3) {
+    static const uint8 sct[] = { 0x00,0x12, 0x00,0x00 };
+    WEXT(sct);
+  }
 
-  // Fixup lengths
-  WriteBE16(handshake_length, (uint)(dst - dst_org - 5));
-  WriteBE16(handshake_inner_length, (uint)(dst - dst_org - 9));
-  WriteBE16(extensions_length, (uint)(dst - extensions_length - 2));
-  
-  // Setup the key generator for outgoing packets. It will be the blake2s hash of
-  // the full message excluding the tls header.
+  // -- key_share (0x0033): GREASE share + x25519 ---------------------------
+  uint8 g_ks = grease_byte();
+  static const uint8 ks_hdr[] = {
+    0x00,0x33,
+    0x00,0x2b, 0x00,0x29,                       // ext len, list len
+    0x00,0x00, 0x00,0x01, 0x00,                 // GREASE share (type overwritten)
+    0x00,0x1d, 0x00,0x20,                        // x25519, 32 bytes
+  };
+  WEXT(ks_hdr);
+  dst[-sizeof(ks_hdr) + 6] = g_ks;              // patch GREASE key type high byte
+  dst[-sizeof(ks_hdr) + 7] = g_ks;              // patch GREASE key type low byte
+  OsGetRandomBytes(postinc(dst, 32), 32);        // x25519 public key
+  dst[-1] &= 0x7f;                              // clear top bit (curve requirement)
+
+  // -- psk_key_exchange_modes (0x002d) -------------------------------------
+  static const uint8 pkem[] = { 0x00,0x2d, 0x00,0x02, 0x01,0x01 };
+  WEXT(pkem);
+
+  // -- supported_versions (0x002b) with GREASE entry -----------------------
+  uint8 g_sv = grease_byte();
+  static const uint8 sv_tail[] = {
+    0x03,0x04,  // TLS 1.3
+    0x03,0x03,  // TLS 1.2
+    0x03,0x02,  // TLS 1.1
+    0x03,0x01,  // TLS 1.0
+  };
+  *dst++=0x00; *dst++=0x2b;                     // ext type
+  *dst++=0x00; *dst++=0x0b;                     // ext len = 11
+  *dst++=0x0a;                                  // versions list len = 10
+  *dst++=g_sv; *dst++=g_sv;                     // GREASE version
+  memcpy(postinc(dst, sizeof(sv_tail)), sv_tail, sizeof(sv_tail));
+
+  // -- compress_certificate (0x001b) – profiles 0,1,2 only ----------------
+  if (profile != 3) {
+    static const uint8 cc[] = { 0x00,0x1b, 0x00,0x03, 0x02,0x00,0x02 };
+    WEXT(cc);
+  }
+
+  // -- Trailing GREASE extension (all profiles) ----------------------------
+  uint8 g_ext2 = grease_byte();
+  *dst++=g_ext2; *dst++=g_ext2; *dst++=0x00; *dst++=0x01; *dst++=0x00;
+
+  // -- pre_shared_key (0x0029) – MUST be last per RFC 8446 -----------------
+  static const uint8 psk_hdr[] = {
+    0x00,0x29, 0x00,0xeb,    // type, length=235
+    0x00,0xc6, 0x00,0xc0,   // identities length=198, identity length=192
+  };
+  WEXT(psk_hdr);
+  OsGetRandomBytes(postinc(dst, 192 + 4), 192 + 4);  // identity + obfuscated_ticket_age
+  *dst++=0x00; *dst++=0x21;                          // binders length = 33
+  OsGetRandomBytes(postinc(dst, 33), 33);            // binder hash
+
+#undef WEXT
+
+  // ── Fix up lengths ──────────────────────────────────────────────────────
+  WriteBE16(ext_len_ptr, (uint)(dst - ext_len_ptr - 2));
+  WriteBE16(rec_len,     (uint)(dst - dst_org - 5));
+  WriteBE16(msg_len,     (uint)(dst - dst_org - 9));
+
+  // ── Derive ChaCha20 stream key from the handshake body ──────────────────
+  // Key = blake2s(ClientHello_body, ObfuscateKey)
+  // The body starts after the 5-byte TLS record header.
   SetChachaStreamingKey(&encryptor_, dst_org + 5, dst - dst_org - 5);
 
-  static const uint8 tls_header6[] = {
-    // change cipher spec
-    0x14, 0x03, 0x03, 0x00, 0x01, 0x01
-  };
-  memcpy(postinc(dst, sizeof(tls_header6)), tls_header6, sizeof(tls_header6));
+  // ── change_cipher_spec record ───────────────────────────────────────────
+  static const uint8 ccs[] = { 0x14,0x03,0x03,0x00,0x01,0x01 };
+  memcpy(postinc(dst, sizeof(ccs)), ccs, sizeof(ccs));
 
   return dst - dst_org;
 }
+
 
 size_t TcpPacketHandler::CreateTls13ServerHello(uint8 *dst) {
   if (!decryptor_initialized_)
@@ -554,12 +608,12 @@ Packet *TcpPacketHandler::GetNextWireguardPacketNormal() {
   while (queue_.size() >= 2) {
     uint32 packet_header = queue_.PeekUint16();
     uint32 packet_size = packet_header & 0x7FFF;
-    if (packet_size + 2 > kPacketCapacity) {
+    if ((uint32)packet_size + 2 > (uint32)kPacketCapacity) {
 error:
       error_flag_ = true;
       return NULL;
     }
-    if (packet_size + 2 > queue_.size())
+    if ((uint32)packet_size + 2 > queue_.size())
       return NULL;
     Packet *packet = queue_.Read(packet_size + 2);
     if (!packet)
@@ -717,13 +771,17 @@ Packet *TcpPacketHandler::GetNextWireguardPacket() {
 
     uint16 header = queue_.PeekUint16();
     if (header == 0x1603) {
-      // This is a SSL client hello, but don't know if it's
-      // chrome or ff, so use ff.
-      obfuscation_mode_ = kObfuscationMode_TlsFirefox;
+      // Real TLS ClientHello from a browser or other TLS client.
+      // Flag it so DoRead can immediately start the proxy without waiting
+      // for error_flag_ (which would deadlock since the browser waits for ServerHello).
+      real_tls_detected_ = true;
+      obfuscation_mode_ = kObfuscationMode_Tls;
     } else if (header <= 1500) {
       // Unobfuscated wireguard headers always start with a low value.
       obfuscation_mode_ = kObfuscationMode_None;
     } else {
+      // Plaintext HTTP or other non-TLS stream.
+      plaintext_detected_ = true;
       read_state_ = READ_CRYPTO_HEADER;
       obfuscation_mode_ = kObfuscationMode_Encrypted;
     }
@@ -740,5 +798,3 @@ void SimplePacketPool::FreeSomePacketsInner() {
   FreePackets(exch(freed_packets_, *p), p, exch(freed_packets_count_, 24) - 24);
 }
 #endif
-
-
