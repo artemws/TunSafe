@@ -670,7 +670,7 @@ public:
 
   // -- from ProcessorDelegate
   virtual void OnConnected(WgPeer *peer) override;
-  virtual void OnConnectionRetry(uint32 attempts) override;
+  virtual void OnConnectionRetry(WgPeer *peer, uint32 attempts) override;
 
   // -- from PluginDelegate
   virtual void OnRequestToken(WgPeer *peer, uint32 type) override;
@@ -783,10 +783,17 @@ void TunsafeBackendBsdImpl::OnConnected(WgPeer *peer) {
   }
 }
 
-void TunsafeBackendBsdImpl::OnConnectionRetry(uint32 attempts) {
+void TunsafeBackendBsdImpl::OnConnectionRetry(WgPeer *peer, uint32 attempts) {
   if (is_connected_ && attempts >= 3) {
     is_connected_ = false;
-    RINFO("Reconnecting...");
+    char buf[kSizeOfAddress];
+    const char *peer_str = "(unknown)";
+    if (peer) {
+      const IpAddr &ep = peer->endpoint();
+      if (ep.sin.sin_family != 0)
+        peer_str = PrintIpAddr(ep, buf);
+    }
+    RINFO("Peer %s disconnected, reconnecting...", peer_str);
   }
 }
 
