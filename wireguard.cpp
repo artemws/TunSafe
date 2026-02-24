@@ -1098,6 +1098,10 @@ void WireguardProcessor::SendKeepalive_Locked(WgPeer *peer) {
   // can't send keepalive if no endpoint is configured
   if (peer->endpoint_.sin.sin_family == 0)
     return;
+  // In hybrid_tcp server mode the data endpoint is unknown until the first
+  // UDP packet arrives from the client — don't send keepalive yet.
+  if (peer->data_endpoint_.sin.sin_family == 0)
+    return;
   // If nothing is queued, insert a keepalive packet
   if (peer->first_queued_packet_ == NULL) {
     Packet *packet = AllocPacket();
