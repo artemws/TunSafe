@@ -633,7 +633,7 @@ void WireguardProcessor::SendHandshakeInitiation(WgPeer *peer) {
     WG_ACQUIRE_LOCK(peer->mutex_);
     int attempts = ++peer->total_handshake_attempts_;
     if (procdel_)
-      procdel_->OnConnectionRetry(attempts);
+      procdel_->OnConnectionRetry(peer, attempts);
     peer->OnHandshakeInitSent();
     packet->addr = peer->endpoint_;
     packet->protocol = peer->endpoint_protocol_;
