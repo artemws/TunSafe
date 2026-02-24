@@ -521,6 +521,10 @@ public:
   void SetPresharedKey(const uint8 preshared_key[WG_SYMMETRIC_KEY_LEN]);
   bool SetPersistentKeepalive(int persistent_keepalive_secs);
   void SetEndpoint(int endpoint_proto, const IpAddr &sin);
+  // Optional separate TCP endpoint for hybrid_tcp mode.
+  // If set, TCP handshakes go here; UDP data goes to endpoint_.
+  void SetTcpEndpoint(const IpAddr &sin);
+  const IpAddr &tcp_endpoint() const { return tcp_endpoint_; }
   void SetAllowMulticast(bool allow);
 
   void SetFeature(int feature, uint8 value);
@@ -650,6 +654,8 @@ private:
 
   // Address of peer
   IpAddr endpoint_;
+  // Separate TCP endpoint for hybrid_tcp (optional). Zero family = use endpoint_.
+  IpAddr tcp_endpoint_;
 
   // Alternative endpoint. This is used in hybrid tcp mode to hold the 
   // udp endpoint.
@@ -823,4 +829,3 @@ struct WgExtensionHooksDefault {
 #ifndef WG_EXTENSION_HOOKS
 #define WG_EXTENSION_HOOKS WgExtensionHooksDefault
 #endif  // WG_EXTENSION_HOOKS
-
