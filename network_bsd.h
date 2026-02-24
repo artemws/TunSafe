@@ -4,6 +4,7 @@
 #define TUNSAFE_NETWORK_BSD_H_
 
 #include <poll.h>
+#include <atomic>
 #include <sys/un.h>
 #include <sys/uio.h>
 #include <string>
@@ -11,6 +12,7 @@
 
 class BaseSocketBsd;
 class TcpSocketBsd;
+class TcpProxySocketBsd;
 class WireguardProcessor;
 class Packet;
 
@@ -18,6 +20,7 @@ class NetworkBsd {
   friend class BaseSocketBsd;
   friend class TcpSocketBsd;
   friend class UdpSocketBsd;
+  friend class TcpProxySocketBsd;
   friend class TunSocketBsd;
 public:
   enum {
@@ -239,6 +242,26 @@ public:
   virtual void Periodic() override;
 
 private:
+  // Rate limiting: track recent connections per source IP.
+  // Key = IPv4 address (or lower 32 bits of IPv6).
+  struct RateEntry {
+    uint32 ip;
+    uint32 count;       // connections in current window
+    uint32 window_sec;  // start of current 10-second window
+  };
+  static const int kMaxRateEntries  = 256;  // LRU table size
+  static const int kRateWindowSec   = 10;   // sliding window
+  static const int kRateMaxConns    = 10;   // max connections per window per IP
+  static const int kMaxTotalIncoming = 64;  // max simultaneous incoming TCP sockets
+
+  RateEntry rate_table_[kMaxRateEntries] = {};
+  int rate_lru_[kMaxRateEntries] = {};      // LRU order (indices into rate_table_)
+  int rate_count_ = 0;                      // number of active entries
+
+  // Returns false and logs if the connection from |addr| should be dropped.
+  bool CheckRateLimit(const IpAddr &addr, uint32 now_sec);
+  int CountIncomingTcpSockets() const;
+
   WireguardProcessor *processor_;
 };
 
@@ -259,6 +282,8 @@ public:
   uint8 endpoint_protocol() { return endpoint_protocol_; }
   const IpAddr &endpoint() { return endpoint_; }
 
+  virtual void Periodic() override;
+
   static void WriteTcpPacket(NetworkBsd *network, WireguardProcessor *processor, Packet *packet);
 
 public:
@@ -267,6 +292,7 @@ private:
   void DoRead();
   void DoWrite();
   void CloseSocketAndDestroy();
+  bool LaunchProxy();
 
   bool readable_, writable_;
   bool got_eof_;
@@ -274,6 +300,10 @@ private:
   bool want_connect_;
   uint8 handshake_attempts_;
   uint32 handshake_timestamp_;
+  // Timestamp (seconds) when this socket was created — used to enforce
+  // an idle timeout on unauthenticated incoming connections.
+  uint32 connect_timestamp_;
+  uint8 proxy_timeout_;
   
   uint wqueue_packets_;
   Packet *wqueue_, **wqueue_end_;
@@ -306,3 +336,7 @@ private:
 
 
 #endif  // TUNSAFE_NETWORK_BSD_H_
+// TcpProxySocketBsd and TcpProxyRemoteBsd are defined inline in network_bsd.cpp.
+// Forward declarations only needed for friend access.
+class TcpProxySocketBsd;
+class TcpProxyRemoteBsd;
