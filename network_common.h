@@ -113,7 +113,8 @@ public:
 
   // Add a new chunk of incoming data; mirrors into raw_replay_ until authenticated.
   void QueueIncomingPacket(Packet *p) {
-    if (!replay_done_) {
+    // Cap replay buffer at 64 KB to prevent memory exhaustion from slow/malicious clients.
+    if (!replay_done_ && raw_replay_.size() < 65536) {
       Packet *copy = raw_replay_.pool()->AllocPacketFromPool();
       if (copy) {
         memcpy(copy->data, p->data, p->size);
