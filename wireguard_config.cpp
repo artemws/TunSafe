@@ -105,6 +105,36 @@ bool WgFileParser::ParseFlag(const char *group, const char *key, char *value) {
       if (!ParseBase64Key(value, binkey))
         return false;
       had_interface_ = true;
+      // Validate the private key before using it.
+      // 1. All-zero key is invalid (means unconfigured / placeholder).
+      {
+        uint8 zero[32] = {};
+        bool is_zero = (memcmp(binkey, zero, 32) == 0);
+        if (is_zero) {
+          RERROR("PrivateKey is all zeros — this is not a valid key. Generate one with: wg genkey");
+          return false;
+        }
+      }
+      // 2. Warn if the key matches the well-known WireGuard example/test keys
+      //    from the official documentation (qibVctgMTkPrPNxLQFBi0PJYJegDd8KwS3JNqiGBimc=
+      //    and similar). These are sometimes copy-pasted by mistake.
+      {
+        // Base64 of the example private key from https://www.wireguard.com/quickstart/
+        static const char * const kKnownTestKeys[] = {
+          "qibVctgMTkPrPNxLQFBi0PJYJegDd8KwS3JNqiGBimc=",  // wg quickstart example
+          "yAnz5TF+lXXJte14tji3zlMNq+hd2rYUIgJBgB3fBmk=",  // wg manpage example
+          NULL
+        };
+        char b64[64];
+        if (base64_encode(binkey, 32, b64, sizeof(b64), NULL)) {
+          for (int i = 0; kKnownTestKeys[i]; i++) {
+            if (strcmp(b64, kKnownTestKeys[i]) == 0) {
+              RERROR("PrivateKey matches a well-known example key — do not use example keys in production!");
+              return false;
+            }
+          }
+        }
+      }
       wg_->dev().SetPrivateKey(binkey);
     } else if (strcmp(key, "ListenPort") == 0) {
       wg_->SetListenPort(atoi(value));
