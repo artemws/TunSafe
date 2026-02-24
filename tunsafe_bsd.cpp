@@ -663,6 +663,7 @@ public:
   // -- from UdpInterface
   virtual bool Configure(int listen_port_udp, int listen_port_tcp) override;
   virtual void WriteUdpPacket(Packet *packet) override;
+  virtual void CloseOutgoingTcpForAddr(const IpAddr &addr) override;
 
   // -- from NetworkBsdDelegate
   virtual void OnSecondLoop(uint64 now) override;
@@ -736,6 +737,18 @@ void TunsafeBackendBsdImpl::WriteUdpPacket(Packet *packet) {
     TcpSocketBsd::WriteTcpPacket(&network_, &processor_, packet);
   } else {
     udp_.WritePacket(packet);
+  }
+}
+
+void TunsafeBackendBsdImpl::CloseOutgoingTcpForAddr(const IpAddr &addr) {
+  for (TcpSocketBsd *tcp = network_.tcp_sockets(); tcp; tcp = tcp->next()) {
+    if (tcp->endpoint_protocol() == kPacketProtocolTcp &&  // outgoing (no IncomingConnection flag)
+        CompareIpAddr(&tcp->endpoint(), &addr) == 0) {
+      char buf[kSizeOfAddress];
+      RINFO("hybrid_tcp: closing TCP socket to %s after handshake complete", PrintIpAddr(addr, buf));
+      delete tcp;
+      return;
+    }
   }
 }
 
