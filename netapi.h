@@ -140,6 +140,10 @@ class UdpInterface {
 public:
   virtual bool Configure(int listen_port_udp, int listen_port_tcp) = 0;
   virtual void WriteUdpPacket(Packet *packet) = 0;
+  // Close the outgoing TCP socket connected to |addr|, if any.
+  // Called after a successful hybrid_tcp handshake so the TCP connection
+  // is not kept alive unnecessarily.
+  virtual void CloseOutgoingTcpForAddr(const IpAddr &addr) {}
 };
 
 extern bool g_allow_pre_post;
