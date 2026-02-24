@@ -1066,10 +1066,6 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleHandshakeResponsePack
   uint original_size = packet->size;
   IpAddr src_addr = packet->addr;
   uint8 src_protocol = packet->protocol;
-
-  RINFO("DEBUG handshake_response: protocol=0x%02x addr_family=%d kPacketProtocolTcp=0x%02x",
-        src_protocol, src_addr.sin.sin_family, kPacketProtocolTcp);
-
   WgPeer *peer = WgPeer::ParseMessageHandshakeResponse(&dev_, packet);
   if (peer) {
     stats_.packets_in++;
