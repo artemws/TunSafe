@@ -43,10 +43,19 @@ jobs:
             ip_to_peer_map.cpp
           grep -n "malloc(offsetof" ip_to_peer_map.cpp
 
+      - name: Patch wireguard.cpp (PacketResultd typo)
+        run: |
+          # GCC 13 rejects the typo 'PacketResultd' even inside #if WITH_SHORT_HEADERS=0.
+          # sed is idempotent - safe even if already fixed in the repo.
+          sed -i 's/WireguardProcessor::PacketResultd/WireguardProcessor::PacketResult/g' wireguard.cpp
+          echo "wireguard.cpp line 710: $(sed -n '710p' wireguard.cpp)"
+
       - uses: actions/upload-artifact@v4
         with:
           name: patched-sources
-          path: ip_to_peer_map.cpp
+          path: |
+            ip_to_peer_map.cpp
+            wireguard.cpp
 
   # ─────────────────────────────────────────────────────────────────
   # Linux x86_64 — static + ASM
@@ -225,6 +234,11 @@ jobs:
           (Get-Content util_win32.cpp) -replace 'if \(!f\) return false;', 'if (!f) return NULL;' |
             Set-Content util_win32.cpp
           Write-Host "Patched util_win32.cpp"
+          # wireguard.cpp:710 has a typo 'PacketResultd' — MSVC rejects it even
+          # inside #if WITH_SHORT_HEADERS=0 blocks.
+          (Get-Content wireguard.cpp) -replace 'PacketResultd', 'PacketResult' |
+            Set-Content wireguard.cpp
+          Write-Host "Patched wireguard.cpp (PacketResultd -> PacketResult)"
           # tunsafe_wg_plugin.cpp must start with #include "stdafx.h" for MSVC PCH.
           # If the repo has a version that starts with #pragma once, prepend the include.
           $pg = Get-Content tunsafe_wg_plugin.cpp -First 1
