@@ -164,6 +164,7 @@ public:
   SimplePacketPool &packet_pool() { return packet_pool_; }
   void WakeUp();
   void PostQueuedItem(QueuedItem *item);
+  void CloseOutgoingTcpForAddr(const IpAddr &addr);
 private:
   void ThreadMain();
   static DWORD WINAPI NetworkThread(void *x);
