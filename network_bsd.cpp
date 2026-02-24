@@ -823,6 +823,60 @@ bool TcpSocketListenerBsd::Initialize(int port) {
   return true;
 }
 
+int TcpSocketListenerBsd::CountIncomingTcpSockets() const {
+  int count = 0;
+  for (TcpSocketBsd *tcp = network_->tcp_sockets(); tcp; tcp = tcp->next())
+    if (tcp->endpoint_protocol() & kPacketProtocolIncomingConnection)
+      count++;
+  return count;
+}
+
+bool TcpSocketListenerBsd::CheckRateLimit(const IpAddr &addr, uint32 now_sec) {
+  // Extract a 32-bit key from the address (IPv4 directly, IPv6 last 32 bits)
+  uint32 ip = (addr.sin.sin_family == AF_INET)
+      ? ReadBE32(&addr.sin.sin_addr)
+      : ReadBE32((uint8*)&addr.sin6.sin6_addr + 12);
+
+  // Search existing entry
+  for (int i = 0; i < rate_count_; i++) {
+    RateEntry &e = rate_table_[rate_lru_[i]];
+    if (e.ip != ip) continue;
+
+    // Move to front of LRU
+    int idx = rate_lru_[i];
+    memmove(&rate_lru_[1], &rate_lru_[0], i * sizeof(int));
+    rate_lru_[0] = idx;
+
+    // Reset window if expired
+    if (now_sec - e.window_sec >= (uint32)kRateWindowSec) {
+      e.window_sec = now_sec;
+      e.count = 0;
+    }
+
+    if (++e.count > (uint32)kRateMaxConns) {
+      if (e.count == (uint32)kRateMaxConns + 1) {
+        char buf[kSizeOfAddress];
+        RERROR("TCP rate limit exceeded for %s — dropping connection", PrintIpAddr(addr, buf));
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // New entry — evict LRU if table full
+  int slot;
+  if (rate_count_ < kMaxRateEntries) {
+    slot = rate_count_++;
+    rate_lru_[rate_count_ - 1] = slot;  // will be moved to front below
+  } else {
+    slot = rate_lru_[kMaxRateEntries - 1];
+  }
+  memmove(&rate_lru_[1], &rate_lru_[0], (rate_count_ - 1) * sizeof(int));
+  rate_lru_[0] = slot;
+  rate_table_[slot] = { ip, 1, now_sec };
+  return true;
+}
+
 void TcpSocketListenerBsd::HandleEvents(int revents) {
   if (revents & POLLIN) {
     // wait if we can't allocate more pollfd
@@ -830,21 +884,38 @@ void TcpSocketListenerBsd::HandleEvents(int revents) {
       SetPollFlags(0);
       return;
     }
+
     IpAddr addr;
     socklen_t len = sizeof(addr);
     int new_fd = accept(fd_, (sockaddr*)&addr, &len);
-    if (new_fd >= 0) {
-      char buf[kSizeOfAddress];
-      RINFO("Created new tcp socket from %s", PrintIpAddr(addr, buf));
-
-      TcpSocketBsd *channel = new TcpSocketBsd(network_, processor_, true);
-      if (channel)
-        channel->InitializeIncoming(new_fd, addr);
-      else
-        close(new_fd);
-    } else {
+    if (new_fd < 0) {
       RERROR("Unix domain socket accept failed");
+      return;
     }
+
+    // Limit total simultaneous incoming TCP connections
+    if (CountIncomingTcpSockets() >= kMaxTotalIncoming) {
+      char buf[kSizeOfAddress];
+      RERROR("TCP connection limit reached, dropping %s", PrintIpAddr(addr, buf));
+      close(new_fd);
+      return;
+    }
+
+    // Per-IP rate limiting
+    uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
+    if (!CheckRateLimit(addr, now_sec)) {
+      close(new_fd);
+      return;
+    }
+
+    char buf[kSizeOfAddress];
+    RINFO("Created new tcp socket from %s", PrintIpAddr(addr, buf));
+
+    TcpSocketBsd *channel = new TcpSocketBsd(network_, processor_, true);
+    if (channel)
+      channel->InitializeIncoming(new_fd, addr);
+    else
+      close(new_fd);
   }
 }
 
@@ -913,6 +984,7 @@ TcpSocketBsd::TcpSocketBsd(NetworkBsd *net, WireguardProcessor *processor, bool 
       age(0),
       handshake_attempts_(0),
       handshake_timestamp_(0),
+      connect_timestamp_((uint32)(OsGetMilliseconds() / 1000)),
       proxy_timeout_(0),
       wqueue_(NULL),
       wqueue_end_(&wqueue_),
@@ -1303,6 +1375,23 @@ bool TcpSocketBsd::LaunchProxy() {
 }
 
 void TcpSocketBsd::Periodic() {
+  // Idle timeout for unauthenticated incoming connections:
+  // if nothing has been received within 30 seconds, close the socket.
+  // This prevents resource exhaustion from clients that connect but never send data.
+  static const uint32 kUnauthIdleTimeoutSec = 30;
+  if ((endpoint_protocol_ & kPacketProtocolIncomingConnection) &&
+      !tcp_packet_handler_.client_hello_parsed() &&
+      !tcp_packet_handler_.error()) {
+    uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
+    if (now_sec - connect_timestamp_ >= kUnauthIdleTimeoutSec) {
+      char buf[kSizeOfAddress];
+      RERROR("Idle timeout for unauthenticated connection from %s — closing",
+             endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, buf) : "(unknown)");
+      CloseSocketAndDestroy();
+      return;
+    }
+  }
+
   if (proxy_timeout_ == 0)
     return;
   if (--proxy_timeout_ > 0)
