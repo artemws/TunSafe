@@ -698,9 +698,14 @@ WgPeer *WgPeer::ParseMessageHandshakeInitiation(WgDevice *dev, Packet *packet) {
     peer->rx_bytes_ += packet->size;
     if (keypair != NULL) {
       // The server side needs to remember the endpoint on incoming handshakes.
+      // In hybrid_tcp mode: save the TCP addr as endpoint_ (for next handshake),
+      // but clear data_endpoint_ — we don't know the client's UDP address yet.
+      // It will be learned when the first UDP data/keepalive packet arrives.
       if (peer->allow_endpoint_change_ && keypair->enabled_features[WG_FEATURE_HYBRID_TCP]) {
         peer->endpoint_ = packet->addr;
         peer->endpoint_protocol_ = packet->protocol;
+        peer->data_endpoint_.sin.sin_family = 0;
+        peer->data_endpoint_protocol_ = kPacketProtocolUdp;
       }
       peer->InsertKeypairInPeer_Locked(keypair);
       peer->OnHandshakeAuthComplete();
@@ -800,8 +805,14 @@ WgPeer *WgPeer::ParseMessageHandshakeResponse(WgDevice *dev, const Packet *packe
   // If hybrid tcp mode was enabled for the connection, switch
   // the data endpoint to the udp endpoint.
   } else if (peer->endpoint_protocol_ == kPacketProtocolTcp) {
-    peer->data_endpoint_protocol_ = keypair->enabled_features[WG_FEATURE_HYBRID_TCP] ? kPacketProtocolUdp : kPacketProtocolTcp;
-    peer->data_endpoint_ = peer->endpoint_;
+    if (keypair->enabled_features[WG_FEATURE_HYBRID_TCP]) {
+      // Don't know client's UDP address yet — wait for first UDP packet.
+      peer->data_endpoint_.sin.sin_family = 0;
+      peer->data_endpoint_protocol_ = kPacketProtocolUdp;
+    } else {
+      peer->data_endpoint_protocol_ = kPacketProtocolTcp;
+      peer->data_endpoint_ = peer->endpoint_;
+    }
   }
 
   WG_EXTENSION_HOOKS::OnPeerIncomingUdp(peer, packet, packet->size);
