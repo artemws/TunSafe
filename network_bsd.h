@@ -300,10 +300,9 @@ private:
   bool want_connect_;
   uint8 handshake_attempts_;
   uint32 handshake_timestamp_;
-  // Timestamp (seconds) when this socket was created — used to enforce
-  // an idle timeout on unauthenticated incoming connections.
   uint32 connect_timestamp_;
   uint8 proxy_timeout_;
+  bool wg_packet_received_;  // true once a valid WireGuard packet came through
   
   uint wqueue_packets_;
   Packet *wqueue_, **wqueue_end_;
