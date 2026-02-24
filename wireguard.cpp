@@ -1064,6 +1064,8 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleHandshakeInitiationPa
 WireguardProcessor::PacketResult WireguardProcessor::HandleHandshakeResponsePacket(Packet *packet) {
   assert(dev_.IsMainThread());
   uint original_size = packet->size;
+  IpAddr src_addr = packet->addr;
+  uint8 src_protocol = packet->protocol;
   WgPeer *peer = WgPeer::ParseMessageHandshakeResponse(&dev_, packet);
   if (peer) {
     stats_.packets_in++;
@@ -1075,6 +1077,15 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleHandshakeResponsePack
     peer->OnHandshakeFullyComplete();
     NotifyHandshakeComplete(peer);
     SendKeepalive_Locked(peer);
+
+    // In hybrid_tcp mode the handshake travels over TCP but data goes over UDP.
+    // Once the handshake is complete the TCP connection is no longer needed —
+    // close it immediately so it doesn't interfere with traffic.
+    if ((src_protocol & kPacketProtocolTcp) &&
+        peer->curr_keypair_ &&
+        peer->curr_keypair_->enabled_features[WG_FEATURE_HYBRID_TCP]) {
+      udp_->CloseOutgoingTcpForAddr(src_addr);
+    }
   } else {
     stats_.invalid_packets_in++;
     stats_.invalid_bytes_in += original_size;
