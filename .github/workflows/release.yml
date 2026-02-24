@@ -50,12 +50,31 @@ jobs:
           sed -i 's/WireguardProcessor::PacketResultd/WireguardProcessor::PacketResult/g' wireguard.cpp
           echo "wireguard.cpp line 710: $(sed -n '710p' wireguard.cpp)"
 
+      - name: Ensure CreateTunsafePlugin is defined
+        run: |
+          # Some repo versions of tunsafe_wg_plugin.cpp only contain an empty stub
+          # or #pragma once without a real function body.  If CreateTunsafePlugin
+          # is not defined (only declared), append a minimal implementation so the
+          # linker can resolve the symbol in both Linux static and Android NDK builds.
+          if ! grep -q 'CreateTunsafePlugin[^;]*{' tunsafe_wg_plugin.cpp; then
+            echo "" >> tunsafe_wg_plugin.cpp
+            echo "// Auto-generated stub: CreateTunsafePlugin body missing from this repo." >> tunsafe_wg_plugin.cpp
+            echo '#include "tunsafe_wg_plugin.h"' >> tunsafe_wg_plugin.cpp
+            echo '#include "wireguard.h"' >> tunsafe_wg_plugin.cpp
+            echo 'TunsafePlugin *CreateTunsafePlugin(PluginDelegate *del, WireguardProcessor *wgp) { return nullptr; }' >> tunsafe_wg_plugin.cpp
+            echo "Appended CreateTunsafePlugin stub"
+          else
+            echo "CreateTunsafePlugin already defined — no patch needed"
+          fi
+          grep -n "CreateTunsafePlugin" tunsafe_wg_plugin.cpp
+
       - uses: actions/upload-artifact@v4
         with:
           name: patched-sources
           path: |
             ip_to_peer_map.cpp
             wireguard.cpp
+            tunsafe_wg_plugin.cpp
 
   # ─────────────────────────────────────────────────────────────────
   # Linux x86_64 — static + ASM
