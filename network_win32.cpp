@@ -1945,7 +1945,7 @@ void TunsafeRunner::OnConnected(WgPeer *peer) {
   }
 }
 
-void TunsafeRunner::OnConnectionRetry(uint32 attempts) {
+void TunsafeRunner::OnConnectionRetry(WgPeer *peer, uint32 attempts) {
   TunsafeBackendWin32 *backend = backend_;
   if (backend->status() == TunsafeBackend::kStatusInitializing)
     backend->SetStatus(TunsafeBackend::kStatusConnecting);
