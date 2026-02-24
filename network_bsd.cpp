@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: AGPL-1.0-only
 // Copyright (C) 2018 Ludvig Strigeus <info@tunsafe.com>. All Rights Reserved.
 #include "network_bsd.h"
+
+// Forward declarations for transparent proxy implementation
+class TcpProxySocketBsd;
+class TcpProxyRemoteBsd;
 #include "network_common.h"
 #include "tunsafe_endian.h"
 #include "util.h"
@@ -13,6 +17,7 @@
 #include <netinet/in.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <netdb.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/uio.h>
@@ -818,6 +823,60 @@ bool TcpSocketListenerBsd::Initialize(int port) {
   return true;
 }
 
+int TcpSocketListenerBsd::CountIncomingTcpSockets() const {
+  int count = 0;
+  for (TcpSocketBsd *tcp = network_->tcp_sockets(); tcp; tcp = tcp->next())
+    if (tcp->endpoint_protocol() & kPacketProtocolIncomingConnection)
+      count++;
+  return count;
+}
+
+bool TcpSocketListenerBsd::CheckRateLimit(const IpAddr &addr, uint32 now_sec) {
+  // Extract a 32-bit key from the address (IPv4 directly, IPv6 last 32 bits)
+  uint32 ip = (addr.sin.sin_family == AF_INET)
+      ? ReadBE32(&addr.sin.sin_addr)
+      : ReadBE32((uint8*)&addr.sin6.sin6_addr + 12);
+
+  // Search existing entry
+  for (int i = 0; i < rate_count_; i++) {
+    RateEntry &e = rate_table_[rate_lru_[i]];
+    if (e.ip != ip) continue;
+
+    // Move to front of LRU
+    int idx = rate_lru_[i];
+    memmove(&rate_lru_[1], &rate_lru_[0], i * sizeof(int));
+    rate_lru_[0] = idx;
+
+    // Reset window if expired
+    if (now_sec - e.window_sec >= (uint32)kRateWindowSec) {
+      e.window_sec = now_sec;
+      e.count = 0;
+    }
+
+    if (++e.count > (uint32)kRateMaxConns) {
+      if (e.count == (uint32)kRateMaxConns + 1) {
+        char buf[kSizeOfAddress];
+        RERROR("TCP rate limit exceeded for %s — dropping connection", PrintIpAddr(addr, buf));
+      }
+      return false;
+    }
+    return true;
+  }
+
+  // New entry — evict LRU if table full
+  int slot;
+  if (rate_count_ < kMaxRateEntries) {
+    slot = rate_count_++;
+    rate_lru_[rate_count_ - 1] = slot;  // will be moved to front below
+  } else {
+    slot = rate_lru_[kMaxRateEntries - 1];
+  }
+  memmove(&rate_lru_[1], &rate_lru_[0], (rate_count_ - 1) * sizeof(int));
+  rate_lru_[0] = slot;
+  rate_table_[slot] = { ip, 1, now_sec };
+  return true;
+}
+
 void TcpSocketListenerBsd::HandleEvents(int revents) {
   if (revents & POLLIN) {
     // wait if we can't allocate more pollfd
@@ -825,20 +884,38 @@ void TcpSocketListenerBsd::HandleEvents(int revents) {
       SetPollFlags(0);
       return;
     }
+
     IpAddr addr;
     socklen_t len = sizeof(addr);
     int new_fd = accept(fd_, (sockaddr*)&addr, &len);
-    if (new_fd >= 0) {
-      RINFO("Created new tcp socket");
-
-      TcpSocketBsd *channel = new TcpSocketBsd(network_, processor_, true);
-      if (channel)
-        channel->InitializeIncoming(new_fd, addr);
-      else
-        close(new_fd);
-    } else {
+    if (new_fd < 0) {
       RERROR("Unix domain socket accept failed");
+      return;
     }
+
+    // Limit total simultaneous incoming TCP connections
+    if (CountIncomingTcpSockets() >= kMaxTotalIncoming) {
+      char buf[kSizeOfAddress];
+      RERROR("TCP connection limit reached, dropping %s", PrintIpAddr(addr, buf));
+      close(new_fd);
+      return;
+    }
+
+    // Per-IP rate limiting
+    uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
+    if (!CheckRateLimit(addr, now_sec)) {
+      close(new_fd);
+      return;
+    }
+
+    char buf[kSizeOfAddress];
+    RINFO("Created new tcp socket from %s", PrintIpAddr(addr, buf));
+
+    TcpSocketBsd *channel = new TcpSocketBsd(network_, processor_, true);
+    if (channel)
+      channel->InitializeIncoming(new_fd, addr);
+    else
+      close(new_fd);
   }
 }
 
@@ -876,9 +953,19 @@ void TcpSocketBsd::WriteTcpPacket(NetworkBsd *network, WireguardProcessor *proce
     FreePacket(packet);
     return;
   }
+  // If the peer has a separate EndpointTCP configured, connect there instead
+  // of using the UDP endpoint address.
+  IpAddr connect_addr = packet->addr;
+  for (WgPeer *peer = processor->dev().first_peer(); peer; peer = peer->next_peer()) {
+    if (CompareIpAddr(&peer->endpoint(), &packet->addr) == 0 &&
+        peer->tcp_endpoint().sin.sin_family != 0) {
+      connect_addr = peer->tcp_endpoint();
+      break;
+    }
+  }
   // Initialize a new tcp socket and connect to the endpoint
   TcpSocketBsd *tcp = new TcpSocketBsd(network, processor, false);
-  if (!tcp || !tcp->InitializeOutgoing(packet->addr)) {
+  if (!tcp || !tcp->InitializeOutgoing(connect_addr)) {
     delete tcp;
     FreePacket(packet);
     return;
@@ -897,6 +984,8 @@ TcpSocketBsd::TcpSocketBsd(NetworkBsd *net, WireguardProcessor *processor, bool 
       age(0),
       handshake_attempts_(0),
       handshake_timestamp_(0),
+      connect_timestamp_((uint32)(OsGetMilliseconds() / 1000)),
+      proxy_timeout_(0),
       wqueue_(NULL),
       wqueue_end_(&wqueue_),
       wqueue_packets_(0),
@@ -915,7 +1004,9 @@ TcpSocketBsd::~TcpSocketBsd() {
   while (*p != this) p = &(*p)->next_;
   *p = next_;
 
-  RINFO("Destroyed tcp socket");
+  char buf[kSizeOfAddress];
+  const char *peer_str = endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, buf) : "(unknown)";
+  RINFO("Destroyed tcp socket from %s", peer_str);
 }
 
 void TcpSocketBsd::InitializeIncoming(int fd, const IpAddr &addr) {
@@ -999,6 +1090,320 @@ void TcpSocketBsd::DoEndloop() {
     DoWrite();
 }
 
+// Launch a transparent TCP proxy to TcpProxyTarget.
+// Steals fd_ and all buffered bytes, creates TcpProxySocketBsd, then deletes *this.
+// Returns true if proxy was launched (caller must NOT touch *this after this call).
+// ============================================================================
+// TcpProxySocketBsd / TcpProxyRemoteBsd
+//
+// Two cooperating BaseSocketBsd objects that together implement a transparent
+// byte-level TCP proxy.
+//
+//  TcpProxySocketBsd  — holds the *client* fd (inherited via BaseSocketBsd)
+//  TcpProxyRemoteBsd  — holds the *remote* (upstream) fd
+//
+// Using two separate objects means each fd gets its own poll slot managed
+// correctly by BaseSocketBsd::CloseSocket() — no hand-rolled slot arithmetic
+// that was previously causing use-after-free crashes.
+// ============================================================================
+
+// Simple byte queue on top of the Packet chain
+struct ByteQueue {
+  Packet *head = nullptr;
+  Packet *tail_pkt = nullptr;   // last packet (for O(1) append of full packets)
+  uint32  bytes = 0;
+
+  void Append(Packet *p) {
+    p->queue_next = nullptr;
+    if (tail_pkt) Packet_NEXT(tail_pkt) = p;
+    else          head = p;
+    tail_pkt = p;
+    bytes += p->size;
+  }
+
+  void Free() {
+    while (head) { Packet *n = Packet_NEXT(head); FreePacket(head); head = n; }
+    tail_pkt = nullptr; bytes = 0;
+  }
+
+  // Write as much as possible to fd; returns false on fatal error.
+  bool Flush(int fd) {
+    while (head) {
+      ssize_t n = write(fd, head->data, head->size);
+      if (n < 0) return (errno == EAGAIN);
+      bytes -= n;
+      if ((size_t)n < (size_t)head->size) { head->data += n; head->size -= n; return true; }
+      Packet *nx = Packet_NEXT(head); FreePacket(head); head = nx;
+      if (!head) tail_pkt = nullptr;
+    }
+    return true;
+  }
+};
+
+class TcpProxyRemoteBsd : public BaseSocketBsd {
+public:
+  TcpProxyRemoteBsd(NetworkBsd *net, int fd, TcpProxySocketBsd *owner)
+      : BaseSocketBsd(net), owner_(owner), connected_(false) {
+    InitPollSlot(fd, POLLOUT);  // wait for connect()
+  }
+  virtual ~TcpProxyRemoteBsd() {}
+  virtual void HandleEvents(int revents) override;
+
+  bool connected() const { return connected_; }
+  ByteQueue &to_remote() { return to_remote_; }
+
+  void WantWrite(bool w) {
+    SetPollFlags(POLLIN | (w ? POLLOUT : 0));
+  }
+
+  TcpProxySocketBsd *owner_;  // public for cross-class nulling in Shutdown()
+private:
+  bool connected_;
+  ByteQueue to_remote_;
+};
+
+class TcpProxySocketBsd : public BaseSocketBsd {
+public:
+  TcpProxySocketBsd(NetworkBsd *net, int client_fd, int remote_fd,
+                    Packet *buf_head, Packet **buf_tail, uint32 buf_bytes);
+  virtual ~TcpProxySocketBsd();
+  virtual void HandleEvents(int revents) override;
+
+  // Called by TcpProxyRemoteBsd when it has data to send to client
+  void OnRemoteData(Packet *p);
+  // Called when remote side closes or errors
+  void OnRemoteGone();
+
+  ByteQueue &to_client() { return to_client_; }
+  void WantWrite(bool w) { SetPollFlags(POLLIN | (w ? POLLOUT : 0)); }
+
+private:
+  void Shutdown();
+  TcpProxyRemoteBsd *remote_;
+  ByteQueue to_client_;
+  bool shutting_down_;
+};
+
+// ---- TcpProxySocketBsd ----
+
+TcpProxySocketBsd::TcpProxySocketBsd(NetworkBsd *net, int client_fd, int remote_fd,
+                                     Packet *buf_head, Packet **buf_tail, uint32 buf_bytes)
+    : BaseSocketBsd(net), remote_(nullptr), shutting_down_(false) {
+  InitPollSlot(client_fd, POLLIN);
+
+  remote_ = new TcpProxyRemoteBsd(net, remote_fd, this);
+
+  // Pre-load replay buffer into remote's send queue
+  if (buf_head) {
+    Packet *p = buf_head;
+    while (p) {
+      Packet *nx = Packet_NEXT(p);
+      p->queue_next = nullptr;
+      remote_->to_remote().Append(p);
+      p = nx;
+    }
+  }
+}
+
+TcpProxySocketBsd::~TcpProxySocketBsd() {
+  to_client_.Free();
+  // remote_ deletes itself via Shutdown path; if we're being destroyed first, kill it.
+  if (remote_) {
+    remote_->owner_ = nullptr;
+    delete remote_;
+    remote_ = nullptr;
+  }
+}
+
+void TcpProxySocketBsd::Shutdown() {
+  if (shutting_down_) return;
+  shutting_down_ = true;
+  // Kill remote side first
+  if (remote_) {
+    remote_->owner_ = nullptr;
+    delete remote_;
+    remote_ = nullptr;
+  }
+  delete this;
+}
+
+void TcpProxySocketBsd::OnRemoteGone() {
+  remote_ = nullptr;
+  // Flush remaining data to client then close
+  if (to_client_.bytes == 0) {
+    Shutdown();
+  } else {
+    // Let HandleEvents drain to_client_, then Shutdown when empty
+  }
+}
+
+void TcpProxySocketBsd::OnRemoteData(Packet *p) {
+  to_client_.Append(p);
+  WantWrite(true);
+}
+
+void TcpProxySocketBsd::HandleEvents(int revents) {
+  if (revents & POLLIN) {
+    // Read from client, forward to remote
+    if (remote_ && remote_->connected()) {
+      Packet *p = AllocPacket();
+      if (p) {
+        ssize_t n = read(fd_, p->data, kPacketCapacity);
+        if (n > 0) {
+          p->size = (int)n;
+          remote_->to_remote().Append(p);
+          remote_->WantWrite(true);
+        } else {
+          FreePacket(p);
+          if (n == 0 || errno != EAGAIN) { Shutdown(); return; }
+        }
+      }
+    }
+  }
+  if (revents & POLLOUT) {
+    if (!to_client_.Flush(fd_)) { Shutdown(); return; }
+    if (to_client_.bytes == 0) {
+      WantWrite(false);
+      if (!remote_) { Shutdown(); return; }  // remote gone, all data drained
+    }
+  }
+  if (revents & (POLLERR | POLLHUP)) { Shutdown(); return; }
+}
+
+// ---- TcpProxyRemoteBsd ----
+
+void TcpProxyRemoteBsd::HandleEvents(int revents) {
+  if (!connected_) {
+    // Check connect() result
+    if (revents & (POLLOUT | POLLERR | POLLHUP)) {
+      int err = 0; socklen_t len = sizeof(err);
+      getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &len);
+      if (err != 0) {
+        RERROR("TcpProxy: upstream connect failed: %s", strerror(err));
+        if (owner_) owner_->OnRemoteGone();
+        owner_ = nullptr;
+        delete this;
+        return;
+      }
+      connected_ = true;
+      RINFO("TcpProxy: connected to upstream, replaying %u bytes", to_remote_.bytes);
+      SetPollFlags(POLLIN | (to_remote_.bytes ? POLLOUT : 0));
+    }
+    return;
+  }
+
+  if (revents & POLLIN) {
+    // Read from remote, forward to client
+    Packet *p = AllocPacket();
+    if (p) {
+      ssize_t n = read(fd_, p->data, kPacketCapacity);
+      if (n > 0) {
+        p->size = (int)n;
+        if (owner_) { owner_->OnRemoteData(p); }
+        else { FreePacket(p); }
+      } else {
+        FreePacket(p);
+        if (n == 0 || errno != EAGAIN) {
+          if (owner_) { owner_->OnRemoteGone(); }
+          owner_ = nullptr;
+          delete this;
+          return;
+        }
+      }
+    }
+  }
+
+  if (revents & POLLOUT) {
+    if (!to_remote_.Flush(fd_)) {
+      if (owner_) { owner_->OnRemoteGone(); }
+      owner_ = nullptr;
+      delete this;
+      return;
+    }
+    if (to_remote_.bytes == 0)
+      WantWrite(false);
+  }
+
+  if (revents & (POLLERR | POLLHUP)) {
+    if (owner_) { owner_->OnRemoteGone(); }
+    owner_ = nullptr;
+    delete this;
+  }
+}
+
+
+bool TcpSocketBsd::LaunchProxy() {
+  const std::string &dom = processor_->proxy_domain();
+  if (dom.empty() || processor_->proxy_port() == 0)
+    return false;
+
+  struct addrinfo hints = {}, *ai = NULL;
+  hints.ai_family   = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  char portstr[8];
+  snprintf(portstr, sizeof(portstr), "%u", (unsigned)processor_->proxy_port());
+  int rc = getaddrinfo(dom.c_str(), portstr, &hints, &ai);
+  if (rc != 0 || !ai) {
+    RERROR("TcpProxy: failed to resolve %s: %s", dom.c_str(),
+           rc ? gai_strerror(rc) : "no results");
+    return false;
+  }
+
+  int rfd = socket(ai->ai_family, SOCK_STREAM, 0);
+  if (rfd < 0) {
+    RERROR("TcpProxy: socket() failed: %s", strerror(errno));
+    freeaddrinfo(ai);
+    return false;
+  }
+  fcntl(rfd, F_SETFD, FD_CLOEXEC);
+  fcntl(rfd, F_SETFL, O_NONBLOCK);
+  connect(rfd, ai->ai_addr, (socklen_t)ai->ai_addrlen);  // EINPROGRESS is ok
+  freeaddrinfo(ai);
+
+  Packet *buf_head = NULL;
+  Packet **buf_tail = &buf_head;
+  uint32 buf_bytes = 0;
+  tcp_packet_handler_.StealReplayBuffer(&buf_head, &buf_tail, &buf_bytes);
+
+  int cfd = StealFd();
+  RINFO("TcpProxy: forwarding to %s:%u (%u buffered bytes)",
+        dom.c_str(), (unsigned)processor_->proxy_port(), buf_bytes);
+
+  new TcpProxySocketBsd(network_, cfd, rfd, buf_head, buf_tail, buf_bytes);
+  delete this;  // fd_ already stolen — CloseSocket() will not double-close
+  return true;
+}
+
+void TcpSocketBsd::Periodic() {
+  // Idle timeout for unauthenticated incoming connections:
+  // if nothing has been received within 30 seconds, close the socket.
+  // This prevents resource exhaustion from clients that connect but never send data.
+  static const uint32 kUnauthIdleTimeoutSec = 30;
+  if ((endpoint_protocol_ & kPacketProtocolIncomingConnection) &&
+      !tcp_packet_handler_.client_hello_parsed() &&
+      !tcp_packet_handler_.error()) {
+    uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
+    if (now_sec - connect_timestamp_ >= kUnauthIdleTimeoutSec) {
+      char buf[kSizeOfAddress];
+      RERROR("Idle timeout for unauthenticated connection from %s — closing",
+             endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, buf) : "(unknown)");
+      CloseSocketAndDestroy();
+      return;
+    }
+  }
+
+  if (proxy_timeout_ == 0)
+    return;
+  if (--proxy_timeout_ > 0)
+    return;
+  // Timer expired: no valid WireGuard packet arrived after TLS ClientHello.
+  // This is a real browser — launch the proxy.
+  RINFO("TcpProxy: timeout after TLS ClientHello, proxying to upstream");
+  if (!LaunchProxy())
+    CloseSocketAndDestroy();
+  // *this may be deleted — do not touch after this point.
+}
+
 void TcpSocketBsd::DoRead() {
   ssize_t bytes_read = readv(fd_, network_->iov_, NetworkBsd::kMaxIovec);
   ssize_t bytes_read_org = bytes_read;
@@ -1009,7 +1414,7 @@ void TcpSocketBsd::DoRead() {
     }
     return;
   }
-  // Go through and read the packet structures that are ready and queue them up
+
   NetworkBsd *net = network_;
   for (size_t j = 0; bytes_read; j++) {
     size_t m = std::min<size_t>(bytes_read, net->iov_[j].iov_len);
@@ -1019,16 +1424,56 @@ void TcpSocketBsd::DoRead() {
     tcp_packet_handler_.QueueIncomingPacket(p);
     net->ReallocateIov(j);
   }
-  // Parse it all
+
+  bool got_wireguard_packet = false;
   while (Packet *p = tcp_packet_handler_.GetNextWireguardPacket()) {
+    got_wireguard_packet = true;
     p->protocol = endpoint_protocol_;
     p->addr = endpoint_;
     processor_->HandleUdpPacket(p, network_->overload_);
+    tcp_packet_handler_.ClearReplayBuffer();  // authenticated — free replay mirror
   }
 
-  if (tcp_packet_handler_.error() || bytes_read_org == 0)
-    CloseSocketAndDestroy();
+  // Distinguish browser from TunSafe client without a timer:
+  //
+  // TunSafe client: sends fake ClientHello (0x1603) immediately followed by
+  //   ChangeCipherSpec + encrypted WireGuard data — all usually in the same
+  //   TCP segment.  By the time GetNextWireguardPacket() returns, either
+  //   got_wireguard_packet==true or queue_size()>0 (more data pending).
+  //
+  // Real browser: sends ClientHello, then STOPS and waits for ServerHello.
+  //   After GetNextWireguardPacket() the queue is empty and no WG packet arrived.
+  //
+  // So: ClientHello parsed + empty queue + no WG packet = browser → proxy now.
+  // If ClientHello hasn't been fully parsed yet (split across reads), arm a
+  // 1-second fallback timer so we don't block forever.
+  if (!processor_->proxy_domain().empty() && processor_->proxy_port() != 0) {
+    if (tcp_packet_handler_.client_hello_parsed() && !got_wireguard_packet &&
+        tcp_packet_handler_.queue_size() == 0) {
+      // Empty queue right after ClientHello — this is a browser.
+      if (!LaunchProxy())
+        CloseSocketAndDestroy();
+      return;
+    }
+    if (tcp_packet_handler_.real_tls_detected() && proxy_timeout_ == 0 &&
+        !got_wireguard_packet) {
+      proxy_timeout_ = 1;  // fallback: ClientHello split across reads
+    }
+    if (got_wireguard_packet)
+      proxy_timeout_ = 0;  // disarm — authenticated TunSafe client
+  }
+
+  if (tcp_packet_handler_.error() || bytes_read_org == 0) {
+    // plaintext HTTP or other unrecognised stream → proxy or close
+    if (tcp_packet_handler_.error() && !processor_->proxy_domain().empty()) {
+      if (!LaunchProxy())
+        CloseSocketAndDestroy();
+    } else {
+      CloseSocketAndDestroy();
+    }
+  }
 }
+
 
 void TcpSocketBsd::DoWrite() {
   enum { kMaxIoWrite = 16 };
@@ -1078,6 +1523,10 @@ void TcpSocketBsd::DoWrite() {
 void TcpSocketBsd::CloseSocketAndDestroy() {
   delete this;
 }
+
+//////////////////////////////////////////////////////////////////////////////////////////////
+// TcpProxySocketBsd - transparent byte-level proxy for unrecognized TLS clients
+//////////////////////////////////////////////////////////////////////////////////////////////
 
 //////////////////////////////////////////////////////////////////////////////////////////////
 NotificationPipeBsd::NotificationPipeBsd(NetworkBsd *network)
