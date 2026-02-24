@@ -492,6 +492,11 @@ bool UdpSocketBsd::DoRead() {
     read_packet->protocol = kPacketProtocolUdp;
     network_->read_packet_ = NULL;
 
+    {
+      char buf[kSizeOfAddress];
+      RINFO("DEBUG UDP recv %d bytes from %s", r, PrintIpAddr(read_packet->addr, buf));
+    }
+
     if (processor_->dev().packet_obfuscator().enabled())
       processor_->dev().packet_obfuscator().DeobfuscatePacket(read_packet);
     processor_->HandleUdpPacket(read_packet, network_->overload_);
