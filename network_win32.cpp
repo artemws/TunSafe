@@ -1918,6 +1918,18 @@ void TunsafeRunner::WriteUdpPacket(Packet *packet) {
   }
 }
 
+void TunsafeRunner::CloseOutgoingTcpForAddr(const IpAddr &addr) {
+  char buf[kSizeOfAddress];
+  RINFO("hybrid_tcp: closing TCP socket to %s after handshake complete", PrintIpAddr(addr, buf));
+  for (TcpSocketWin32 *tcp = net_.tcp_socket_; tcp; tcp = tcp->next_) {
+    if (tcp->endpoint_protocol_ == kPacketProtocolTcp &&
+        CompareIpAddr(&tcp->endpoint_, &addr) == 0) {
+      tcp->CloseSocket();
+      return;
+    }
+  }
+}
+
 void TunsafeRunner::OnConnected(WgPeer *peer) {
   TunsafeBackendWin32 *backend = backend_;
   if (backend->status() != TunsafeBackend::kStatusConnected) {
