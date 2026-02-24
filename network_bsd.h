@@ -242,6 +242,26 @@ public:
   virtual void Periodic() override;
 
 private:
+  // Rate limiting: track recent connections per source IP.
+  // Key = IPv4 address (or lower 32 bits of IPv6).
+  struct RateEntry {
+    uint32 ip;
+    uint32 count;       // connections in current window
+    uint32 window_sec;  // start of current 10-second window
+  };
+  static const int kMaxRateEntries  = 256;  // LRU table size
+  static const int kRateWindowSec   = 10;   // sliding window
+  static const int kRateMaxConns    = 10;   // max connections per window per IP
+  static const int kMaxTotalIncoming = 64;  // max simultaneous incoming TCP sockets
+
+  RateEntry rate_table_[kMaxRateEntries] = {};
+  int rate_lru_[kMaxRateEntries] = {};      // LRU order (indices into rate_table_)
+  int rate_count_ = 0;                      // number of active entries
+
+  // Returns false and logs if the connection from |addr| should be dropped.
+  bool CheckRateLimit(const IpAddr &addr, uint32 now_sec);
+  int CountIncomingTcpSockets() const;
+
   WireguardProcessor *processor_;
 };
 
@@ -280,9 +300,9 @@ private:
   bool want_connect_;
   uint8 handshake_attempts_;
   uint32 handshake_timestamp_;
-  // Countdown in seconds: when it hits zero on an unauthenticated incoming
-  // connection that sent a real TLS ClientHello, we launch the proxy.
-  // 0 = not armed.
+  // Timestamp (seconds) when this socket was created — used to enforce
+  // an idle timeout on unauthenticated incoming connections.
+  uint32 connect_timestamp_;
   uint8 proxy_timeout_;
   
   uint wqueue_packets_;
