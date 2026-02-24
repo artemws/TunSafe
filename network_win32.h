@@ -280,7 +280,7 @@ public:
   virtual void WriteUdpPacket(Packet *packet) override;
 
   virtual void OnConnected(WgPeer *peer) override;
-  virtual void OnConnectionRetry(uint32 attempts) override;
+  virtual void OnConnectionRetry(WgPeer *peer, uint32 attempts) override;
 
   // -- from PluginDelegate
   virtual void OnRequestToken(WgPeer *peer, uint32 type) override;
