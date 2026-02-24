@@ -986,6 +986,7 @@ TcpSocketBsd::TcpSocketBsd(NetworkBsd *net, WireguardProcessor *processor, bool 
       handshake_timestamp_(0),
       connect_timestamp_((uint32)(OsGetMilliseconds() / 1000)),
       proxy_timeout_(0),
+      wg_packet_received_(false),
       wqueue_(NULL),
       wqueue_end_(&wqueue_),
       wqueue_packets_(0),
@@ -1378,8 +1379,10 @@ void TcpSocketBsd::Periodic() {
   // Idle timeout for unauthenticated incoming connections:
   // if nothing has been received within 30 seconds, close the socket.
   // This prevents resource exhaustion from clients that connect but never send data.
+  // Skip if a WireGuard packet already came through — the socket is in use for hybrid_tcp.
   static const uint32 kUnauthIdleTimeoutSec = 30;
   if ((endpoint_protocol_ & kPacketProtocolIncomingConnection) &&
+      !wg_packet_received_ &&
       !tcp_packet_handler_.client_hello_parsed() &&
       !tcp_packet_handler_.error()) {
     uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
@@ -1428,6 +1431,7 @@ void TcpSocketBsd::DoRead() {
   bool got_wireguard_packet = false;
   while (Packet *p = tcp_packet_handler_.GetNextWireguardPacket()) {
     got_wireguard_packet = true;
+    wg_packet_received_ = true;
     p->protocol = endpoint_protocol_;
     p->addr = endpoint_;
     processor_->HandleUdpPacket(p, network_->overload_);
