@@ -60,7 +60,7 @@ struct WgProcessorStats {
 
 class ProcessorDelegate {
 public:
-  virtual void OnConnected() = 0;
+  virtual void OnConnected(WgPeer *peer) = 0;
   virtual void OnConnectionRetry(uint32 attempts) = 0;
 };
 
@@ -156,7 +156,7 @@ private:
   PacketResult HandleShortHeaderFormatPacket(uint32 tag, Packet *packet);
   PacketResult CheckIncomingHandshakeRateLimit(Packet *packet, bool overload);
   bool HandleIcmpv6NeighborSolicitation(const byte *data, size_t data_size);
-  void NotifyHandshakeComplete();
+  void NotifyHandshakeComplete(WgPeer *peer);
 
   ProcessorDelegate *procdel_;
   TunInterface *tun_;
@@ -193,4 +193,3 @@ private:
   // IPs we want to map to the default route
   std::vector<WgCidrAddr> excluded_ips_;
 };
-
