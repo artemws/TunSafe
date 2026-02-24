@@ -29,6 +29,7 @@ WireguardProcessor::WireguardProcessor(UdpInterface *udp, TunInterface *tun, Pro
   memset(&stats_, 0, sizeof(stats_));
   listen_port_ = 0;
   listen_port_tcp_ = 0;
+  proxy_port_ = 0;
   network_discovery_spoofing_ = false;
   add_routes_mode_ = true;
   dns_blocking_ = true;
@@ -58,6 +59,11 @@ void WireguardProcessor::SetListenPortTcp(int listen_port) {
       RINFO("ConfigureUdp failed");
     }
   }
+}
+
+void WireguardProcessor::SetTcpProxyTarget(const char *domain, int port) {
+  proxy_domain_ = domain ? domain : "";
+  proxy_port_ = (uint16)port;
 }
 
 
@@ -627,10 +633,17 @@ void WireguardProcessor::SendHandshakeInitiation(WgPeer *peer) {
     WG_ACQUIRE_LOCK(peer->mutex_);
     int attempts = ++peer->total_handshake_attempts_;
     if (procdel_)
-      procdel_->OnConnectionRetry(attempts);
+      procdel_->OnConnectionRetry(peer, attempts);
     peer->OnHandshakeInitSent();
-    packet->addr = peer->endpoint_;
-    packet->protocol = peer->endpoint_protocol_;
+    // If a separate TCP endpoint is configured (EndpointTCP), send the
+    // handshake via TCP regardless of the UDP endpoint protocol.
+    if (peer->tcp_endpoint().sin.sin_family != 0) {
+      packet->addr     = peer->tcp_endpoint();
+      packet->protocol = kPacketProtocolTcp;
+    } else {
+      packet->addr     = peer->endpoint_;
+      packet->protocol = peer->endpoint_protocol_;
+    }
     WG_EXTENSION_HOOKS::OnPeerOutgoingUdp(peer, packet);
     peer->tx_bytes_ += packet->size;
 
@@ -822,7 +835,7 @@ getout:
 }
 #endif  // WITH_SHORT_HEADERS
 
-void WireguardProcessor::NotifyHandshakeComplete() {
+void WireguardProcessor::NotifyHandshakeComplete(WgPeer *peer) {
   uint64 now = OsGetMilliseconds();
   
   // todo: should lock something
@@ -831,7 +844,7 @@ void WireguardProcessor::NotifyHandshakeComplete() {
     stats_.first_complete_handshake_timestamp = now;
 
   if (procdel_)
-    procdel_->OnConnected();
+    procdel_->OnConnected(peer);
 }
 
 WireguardProcessor::PacketResult WireguardProcessor::HandleAuthenticatedDataPacket_WillUnlock(WgKeypair *keypair, Packet *packet, uint data_size) {
@@ -869,7 +882,7 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleAuthenticatedDataPack
   if (peer->CheckSwitchToNextKey_Locked(keypair)) {
     stats_.handshakes_in_success++;
     peer->OnHandshakeFullyComplete();
-    NotifyHandshakeComplete();
+    NotifyHandshakeComplete(peer);
     SendQueuedPackets_Locked(peer);
   }
 
@@ -1051,6 +1064,12 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleHandshakeInitiationPa
 WireguardProcessor::PacketResult WireguardProcessor::HandleHandshakeResponsePacket(Packet *packet) {
   assert(dev_.IsMainThread());
   uint original_size = packet->size;
+  IpAddr src_addr = packet->addr;
+  uint8 src_protocol = packet->protocol;
+
+  RINFO("DEBUG handshake_response: protocol=0x%02x addr_family=%d kPacketProtocolTcp=0x%02x",
+        src_protocol, src_addr.sin.sin_family, kPacketProtocolTcp);
+
   WgPeer *peer = WgPeer::ParseMessageHandshakeResponse(&dev_, packet);
   if (peer) {
     stats_.packets_in++;
@@ -1060,8 +1079,17 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleHandshakeResponsePack
     WG_SCOPED_LOCK(peer->mutex_);
     peer->OnHandshakeAuthComplete();
     peer->OnHandshakeFullyComplete();
-    NotifyHandshakeComplete();
+    NotifyHandshakeComplete(peer);
     SendKeepalive_Locked(peer);
+
+    // In hybrid_tcp mode the handshake travels over TCP but data goes over UDP.
+    // Once the handshake is complete the TCP connection is no longer needed —
+    // close it immediately so it doesn't interfere with traffic.
+    if ((src_protocol & kPacketProtocolTcp) &&
+        peer->curr_keypair_ &&
+        peer->curr_keypair_->enabled_features[WG_FEATURE_HYBRID_TCP]) {
+      udp_->CloseOutgoingTcpForAddr(src_addr);
+    }
   } else {
     stats_.invalid_packets_in++;
     stats_.invalid_bytes_in += original_size;
