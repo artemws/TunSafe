@@ -316,52 +316,7 @@ private:
 
 
 #endif  // TUNSAFE_NETWORK_BSD_H_
-// ---------------------------------------------------------------------------
-// TcpProxySocketBsd
-//
-// Transparently proxies an already-accepted client TCP connection to a remote
-// host.  Created when an incoming TLS connection is not recognized as a
-// TunSafe client (error_flag_ set).  At that point the raw bytes already
-// buffered in tcp_packet_handler_.queue_ are forwarded verbatim, followed by
-// whatever the client sends afterwards.
-//
-// Both half-connections are kept in a single object:
-//   fd_       – client socket (inherited via BaseSocketBsd)
-//   remote_fd_– socket connected to the upstream server
-// ---------------------------------------------------------------------------
-class TcpProxySocketBsd : public BaseSocketBsd {
-public:
-  // Takes ownership of client_fd and remote_fd.
-  TcpProxySocketBsd(NetworkBsd *net, int client_fd, int remote_fd,
-                    Packet *buffered, Packet **buffered_end, uint32 buffered_bytes);
-  virtual ~TcpProxySocketBsd();
-
-  virtual void HandleEvents(int revents) override;
-
-  // Poll slot for the remote socket is stored separately.
-  int remote_pollfd_slot() const { return remote_pollfd_slot_; }
-
-private:
-  void DoClientRead();
-  void DoClientWrite();
-  void DoRemoteRead();
-  void DoRemoteWrite();
-  void CloseAll();
-  void EnqueueToRemote(Packet *p);
-  void EnqueueToClient(Packet *p);
-
-  int remote_fd_;
-  int remote_pollfd_slot_;
-
-  // Bytes to send to remote (initially the replayed ClientHello)
-  Packet *to_remote_, **to_remote_end_;
-  uint32 to_remote_bytes_;
-
-  // Bytes to send back to client (from upstream server)
-  Packet *to_client_, **to_client_end_;
-  uint32 to_client_bytes_;
-
-  bool client_rd_open_, client_wr_open_;
-  bool remote_rd_open_, remote_wr_open_;
-  bool remote_connected_;
-};
+// TcpProxySocketBsd and TcpProxyRemoteBsd are defined inline in network_bsd.cpp.
+// Forward declarations only needed for friend access.
+class TcpProxySocketBsd;
+class TcpProxyRemoteBsd;
