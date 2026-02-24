@@ -61,7 +61,7 @@ struct WgProcessorStats {
 class ProcessorDelegate {
 public:
   virtual void OnConnected(WgPeer *peer) = 0;
-  virtual void OnConnectionRetry(uint32 attempts) = 0;
+  virtual void OnConnectionRetry(WgPeer *peer, uint32 attempts) = 0;
 };
 
 enum InternetBlockState {
