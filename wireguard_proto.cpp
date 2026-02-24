@@ -1324,6 +1324,10 @@ void WgPeer::SetEndpoint(int endpoint_proto, const IpAddr &sin) {
   data_endpoint_ = sin;
 }
 
+void WgPeer::SetTcpEndpoint(const IpAddr &sin) {
+  tcp_endpoint_ = sin;
+}
+
 bool WgPeer::SetPersistentKeepalive(int persistent_keepalive_secs) {
   if (persistent_keepalive_secs < 0 || persistent_keepalive_secs > 65535)
     return false;
