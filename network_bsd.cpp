@@ -834,7 +834,8 @@ void TcpSocketListenerBsd::HandleEvents(int revents) {
     socklen_t len = sizeof(addr);
     int new_fd = accept(fd_, (sockaddr*)&addr, &len);
     if (new_fd >= 0) {
-      RINFO("Created new tcp socket");
+      char buf[kSizeOfAddress];
+      RINFO("Created new tcp socket from %s", PrintIpAddr(addr, buf));
 
       TcpSocketBsd *channel = new TcpSocketBsd(network_, processor_, true);
       if (channel)
@@ -931,7 +932,9 @@ TcpSocketBsd::~TcpSocketBsd() {
   while (*p != this) p = &(*p)->next_;
   *p = next_;
 
-  RINFO("Destroyed tcp socket");
+  char buf[kSizeOfAddress];
+  const char *peer_str = endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, buf) : "(unknown)";
+  RINFO("Destroyed tcp socket from %s", peer_str);
 }
 
 void TcpSocketBsd::InitializeIncoming(int fd, const IpAddr &addr) {
