@@ -742,18 +742,14 @@ void TunsafeBackendBsdImpl::WriteUdpPacket(Packet *packet) {
 
 void TunsafeBackendBsdImpl::CloseOutgoingTcpForAddr(const IpAddr &addr) {
   char buf[kSizeOfAddress];
-  RINFO("DEBUG CloseOutgoingTcpForAddr called for %s", PrintIpAddr(addr, buf));
   for (TcpSocketBsd *tcp = network_.tcp_sockets(); tcp; tcp = tcp->next()) {
-    RINFO("DEBUG tcp socket: protocol=0x%02x endpoint_family=%d",
-          tcp->endpoint_protocol(), tcp->endpoint().sin.sin_family);
     if (tcp->endpoint_protocol() == kPacketProtocolTcp &&
         CompareIpAddr(&tcp->endpoint(), &addr) == 0) {
-      RINFO("hybrid_tcp: closing TCP socket to %s after handshake complete", buf);
+      RINFO("hybrid_tcp: closing TCP socket to %s after handshake complete", PrintIpAddr(addr, buf));
       delete tcp;
       return;
     }
   }
-  RINFO("DEBUG CloseOutgoingTcpForAddr: no matching socket found");
 }
 
 void TunsafeBackendBsdImpl::RunLoop() {
