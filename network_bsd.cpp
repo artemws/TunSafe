@@ -881,9 +881,19 @@ void TcpSocketBsd::WriteTcpPacket(NetworkBsd *network, WireguardProcessor *proce
     FreePacket(packet);
     return;
   }
+  // If the peer has a separate EndpointTCP configured, connect there instead
+  // of using the UDP endpoint address.
+  IpAddr connect_addr = packet->addr;
+  for (WgPeer *peer = processor->dev().first_peer(); peer; peer = peer->next_peer()) {
+    if (CompareIpAddr(&peer->endpoint(), &packet->addr) == 0 &&
+        peer->tcp_endpoint().sin.sin_family != 0) {
+      connect_addr = peer->tcp_endpoint();
+      break;
+    }
+  }
   // Initialize a new tcp socket and connect to the endpoint
   TcpSocketBsd *tcp = new TcpSocketBsd(network, processor, false);
-  if (!tcp || !tcp->InitializeOutgoing(packet->addr)) {
+  if (!tcp || !tcp->InitializeOutgoing(connect_addr)) {
     delete tcp;
     FreePacket(packet);
     return;
