@@ -1918,7 +1918,7 @@ void TunsafeRunner::WriteUdpPacket(Packet *packet) {
   }
 }
 
-void TunsafeRunner::OnConnected() {
+void TunsafeRunner::OnConnected(WgPeer *peer) {
   TunsafeBackendWin32 *backend = backend_;
   if (backend->status() != TunsafeBackend::kStatusConnected) {
     const WgCidrAddr *ipv4_addr = NULL;
@@ -1930,8 +1930,16 @@ void TunsafeRunner::OnConnected() {
     }
     backend->ipv4_ip_ = ipv4_addr ? ReadBE32(ipv4_addr->addr) : 0;
     if (backend->status() != TunsafeBackend::kStatusReconnecting) {
-      char buf[kSizeOfAddress];
-      RINFO("Connection established. IP %s", ipv4_addr ? print_ip_prefix(buf, AF_INET, ipv4_addr->addr, -1) : "(none)");
+      char buf[kSizeOfAddress], peer_buf[kSizeOfAddress];
+      const char *peer_str = "(unknown)";
+      if (peer) {
+        const IpAddr &ep = peer->endpoint();
+        if (ep.sin.sin_family != 0)
+          peer_str = PrintIpAddr(ep, peer_buf);
+      }
+      RINFO("Connection established. IP %s, peer %s",
+            ipv4_addr ? print_ip_prefix(buf, AF_INET, ipv4_addr->addr, -1) : "(none)",
+            peer_str);
     }
     backend->SetStatus(TunsafeBackend::kStatusConnected);
   }
