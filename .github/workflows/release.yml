@@ -358,6 +358,20 @@ jobs:
           ndk-version: r26d
           add-to-path: true
 
+      - name: Patch network_android.cpp (OnConnected signature)
+        run: |
+          # OnConnected signature changed to OnConnected(WgPeer *peer) —
+          # patch the Android backend to match.
+          sed -i \
+            's/void OnConnected() override/void OnConnected(WgPeer *peer) override/' \
+            android/network_android.cpp
+          # Also patch the implementation body if it exists without the parameter
+          sed -i \
+            's/void AndroidBackend::OnConnected()/void AndroidBackend::OnConnected(WgPeer *peer)/' \
+            android/network_android.cpp
+          echo "network_android.cpp OnConnected lines:"
+          grep -n "OnConnected" android/network_android.cpp
+
       - name: Build libnative-lib.so (${{ matrix.abi }})
         env:
           NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
