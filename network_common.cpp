@@ -127,6 +127,7 @@ TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfusc
      raw_replay_(packet_pool),
      tls_queue_(packet_pool),
      write_state_(is_incoming),
+     is_server_(is_incoming),
      obfuscation_mode_(kObfuscationMode_None) {
 
   if (obfuscator->enabled() && obfuscator->obfuscate_tcp() != TcpPacketHandler::kObfuscationMode_None) {
@@ -151,6 +152,9 @@ TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfusc
   plaintext_detected_ = false;
   replay_done_ = false;
   decryptor_initialized_ = false;
+  fake_hs_records_left_ = 0;
+  fake_out_head_ = NULL;
+  fake_out_tail_ = &fake_out_head_;
   predicted_key_in_ = predicted_key_out_ = 0;
   predicted_serial_in_ = predicted_serial_out_ = 0;
 }
@@ -515,6 +519,28 @@ void TcpPacketHandler::PrepareOutgoingPacketsObfuscate(Packet *p) {
   chacha20_streaming_crypt(&encryptor_, p->data, 18);
 }
 
+// Write one fake TLS 1.3 Application Data record of |payload_size| random bytes.
+// Returns number of bytes written.
+static size_t WriteFakeTlsRecord(uint8 *dst, uint payload_size) {
+  dst[0] = 0x17; dst[1] = 0x03; dst[2] = 0x03;
+  dst[3] = (uint8)(payload_size >> 8);
+  dst[4] = (uint8)(payload_size);
+  OsGetRandomBytes(dst + 5, payload_size);
+  return 5 + payload_size;
+}
+
+// Allocate a new packet pre-filled with one fake TLS Application Data record.
+// Returns NULL if no memory. The record payload is |payload_size| random bytes.
+static Packet *MakeFakeTlsPacket(uint payload_size) {
+  Packet *pkt = AllocPacket();
+  if (!pkt) return NULL;
+  if (5 + payload_size > kPacketCapacity) { FreePacket(pkt); return NULL; }
+  pkt->size = (uint)WriteFakeTlsRecord(pkt->data, payload_size);
+  pkt->prepared = true;
+  Packet_NEXT(pkt) = NULL;
+  return pkt;
+}
+
 static void PrependTlsApplicationData(Packet *p, uint data_size) {
   p->size += 5;
   p->data -= 5;
@@ -526,15 +552,57 @@ static void PrependTlsApplicationData(Packet *p, uint data_size) {
 }
 
 void TcpPacketHandler::PrepareOutgoingPacketsTLS13(Packet *p) {
-  // Collect a number of packets, but add just a single TLS header
+  // Server side: on first call after ServerHello, populate fake_out_head_ with
+  // post-ServerHello handshake records that DoWrite will send before real data.
+  if (fake_hs_records_left_ > 0) {
+    fake_hs_records_left_ = 0;
+    uint8 rnd[4]; OsGetRandomBytes(rnd, sizeof(rnd));
+
+    auto enqueue_fake = [&](uint payload_size) {
+      Packet *fp = MakeFakeTlsPacket(payload_size);
+      if (fp) { *fake_out_tail_ = fp; fake_out_tail_ = (Packet**)&Packet_NEXT(fp); }
+    };
+
+    // Mimic Cloudflare TLS 1.3 post-ServerHello encrypted handshake sequence:
+    //   EncryptedExtensions (~50-90 bytes)
+    //   Certificate part 1  (1400 bytes — typical TCP segment)
+    //   Certificate part 2  (800-1600 bytes — remainder of cert chain)
+    //   CertificateVerify   (~80-120 bytes)
+    //   Finished            (52 bytes)
+    enqueue_fake(50 + (rnd[0] % 41));
+    enqueue_fake(1400);
+    enqueue_fake(800 + (uint(rnd[1]) % 801));
+    enqueue_fake(80  + (rnd[2] % 41));
+    enqueue_fake(52);
+  }
+
+  // Normal path: wrap real packets in a TLS Application Data record.
   uint total_size = 0;
   Packet *cur = p;
   do {
     PrepareOutgoingPacketsObfuscate(cur);
     total_size += cur->size;
   } while (total_size < 12000 && (cur = Packet_NEXT(cur)));
+
+  // Padding (B): ~30% chance to prepend a small dummy Application Data record
+  // (8-64 random bytes) to break packet-size correlation with WireGuard.
+  uint8 pad_rnd; OsGetRandomBytes(&pad_rnd, 1);
+  if (pad_rnd < 77) {
+    uint8 pad_sz_rnd; OsGetRandomBytes(&pad_sz_rnd, 1);
+    uint pad_size = 8 + (pad_sz_rnd % 57);  // 8..64 bytes
+    size_t prefix = 5 + pad_size;
+    if ((size_t)(p->data - p->data_buf) >= prefix) {
+      PrependTlsApplicationData(p, total_size);
+      p->data -= prefix;
+      p->size  += (uint)prefix;
+      WriteFakeTlsRecord(p->data, pad_size);
+      return;
+    }
+  }
+
   PrependTlsApplicationData(p, total_size);
 }
+
 
 Packet *TcpPacketHandler::GetNextWireguardPacketObfuscate(TcpPacketQueue *queue) {
   if (read_state_ == READ_CRYPTO_HEADER) {
@@ -734,6 +802,11 @@ void TcpPacketHandler::PrepareOutgoingPacketsWithHeader(Packet *p) {
     }
   }
   write_state_ = 2;
+  // Server side: queue fake post-ServerHello records to be injected before
+  // the first real data packet, mimicking TLS 1.3 EncryptedExtensions +
+  // Certificate + CertificateVerify + Finished sequence.
+  if (is_server_ && obfuscation_mode_ == kObfuscationMode_Tls)
+    fake_hs_records_left_ = 4;
   PrepareOutgoingPackets(p);
   if (hello_size + p->size > kPacketCapacity) {
     RERROR("Outgoing TCP packet too big.");
