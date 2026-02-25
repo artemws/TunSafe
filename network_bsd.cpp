@@ -33,6 +33,10 @@ class TcpProxyRemoteBsd;
 #include <sys/prctl.h>
 #endif
 
+#if defined(OS_ANDROID)
+#include <android/log.h>
+#endif
+
 #include <algorithm>
 
 #include "wireguard.h"
@@ -47,8 +51,13 @@ class TcpProxyRemoteBsd;
 static Packet *freelist;
 
 void tunsafe_die(const char *msg) {
+#if defined(OS_ANDROID)
+  __android_log_print(6 /*ANDROID_LOG_ERROR*/, "TunSafe", "FATAL: %s", msg);
+  abort();
+#else
   fprintf(stderr, "%s\n", msg);
   exit(1);
+#endif
 }
 
 void SetThreadName(const char *name) {
@@ -1034,6 +1043,13 @@ bool TcpSocketBsd::InitializeOutgoing(const IpAddr &addr) {
   if (fd < 0) { perror("socket: outgoing tcp"); return false; }
   fcntl(fd, F_SETFD, FD_CLOEXEC);
   fcntl(fd, F_SETFL, O_NONBLOCK);
+
+#if defined(OS_ANDROID)
+  // On Android the TCP socket must be protected from the VPN tunnel before
+  // connect() is called, otherwise the SYN packet loops back into the tun.
+  extern bool android_protect_socket_extern(int fd);
+  android_protect_socket_extern(fd);
+#endif
 
   char buf[kSizeOfAddress];
   RINFO("Connecting to tcp://%s:%d...", PrintIpAddr(endpoint_, buf), ReadBE16(&endpoint_.sin.sin_port));
