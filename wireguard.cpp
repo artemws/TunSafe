@@ -450,12 +450,6 @@ WireguardProcessor::PacketResult WireguardProcessor::WriteAndEncryptPacketToUdp_
   keypair->send_ctr = send_ctr + 1;
   packet->addr = peer->data_endpoint_;
   packet->protocol = peer->data_endpoint_protocol_;
-  {
-    char buf[kSizeOfAddress];
-    RINFO("DEBUG sending %s proto=0x%02x to=%s",
-          size == 0 ? "keepalive" : "data",
-          packet->protocol, PrintIpAddr(packet->addr, buf));
-  }
 
   WG_EXTENSION_HOOKS::OnPeerOutgoingUdp(peer, packet);
 
@@ -862,10 +856,6 @@ WireguardProcessor::PacketResult WireguardProcessor::HandleAuthenticatedDataPack
   if (peer->allow_endpoint_change_ && 
       (CompareIpAddr(&peer->data_endpoint_, &packet->addr) | (peer->data_endpoint_protocol_ ^ packet->protocol)) != 0) {
 
-    char buf[kSizeOfAddress];
-    RINFO("DEBUG data pkt: proto=0x%02x from=%s data_ep_was_family=%d",
-          packet->protocol, PrintIpAddr(packet->addr, buf), peer->data_endpoint_.sin.sin_family);
-
 #if WITH_SHORT_HEADERS
     // When the endpoint changes, forget about using the short key.
     keypair->broadcast_short_key = 0;
@@ -1111,7 +1101,6 @@ void WireguardProcessor::SendKeepalive_Locked(WgPeer *peer) {
   // In hybrid_tcp server mode the data endpoint is unknown until the first
   // UDP packet arrives from the client — don't send keepalive yet.
   if (peer->data_endpoint_.sin.sin_family == 0) {
-    RINFO("DEBUG SendKeepalive skipped: data_endpoint unknown (hybrid_tcp server waiting for UDP)");
     return;
   }
   // If nothing is queued, insert a keepalive packet
