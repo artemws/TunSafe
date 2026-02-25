@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-1.0-only
 // Copyright (C) 2018 Ludvig Strigeus <info@tunsafe.com>. All Rights Reserved.
 #include <stdafx.h>
-#include "network_win32_tcp.h"
 #include "network_win32.h"
 #include <Mswsock.h>
 #include <ws2ipdef.h>
+#include "tunsafe_endian.h"
+#include "wireguard_proto.h"
 #include "util.h"
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -139,6 +140,18 @@ void TcpSocketWin32::DoMoreReads() {
 void TcpSocketWin32::DoMoreWrites() {
   assert(state_ != STATE_ERROR);
   if (writes_active_ == 0) {
+    // Prepend any fake TLS records (post-ServerHello simulation) to the front
+    // of the write queue so they go out before the first real WireGuard data.
+    Packet *fake = tcp_packet_handler_.StealFakeOutPackets();
+    if (fake) {
+      // Find tail of fake chain and link it to current wqueue_ head.
+      Packet *tail = fake;
+      while (Packet_NEXT(tail)) tail = Packet_NEXT(tail);
+      Packet_NEXT(tail) = wqueue_;
+      if (wqueue_ == NULL) wqueue_end_ = &Packet_NEXT(tail);
+      wqueue_ = fake;
+    }
+
     WSABUF wsabuf[kMaxWsaBuf];
     uint32 num_wsabuf = 0;
 
@@ -179,10 +192,31 @@ void TcpSocketWin32::DoMoreWrites() {
 
 void TcpSocketWin32::DoIO() {
   // Deferred close: hybrid_tcp sockets linger briefly after handshake.
-  if (deferred_close_at_ != 0 &&
-      (uint32)(OsGetMilliseconds() / 1000) >= deferred_close_at_) {
-    CloseSocket();
-    // Fall through — state_ is now STATE_ERROR, handled below.
+  if (deferred_close_at_ != 0) {
+    uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
+    if (now_sec >= deferred_close_at_) {
+      CloseSocket();
+      // Fall through — state_ is now STATE_ERROR, handled below.
+    } else if (state_ == STATE_CONNECTED &&
+               tcp_packet_handler_.client_hello_parsed() &&
+               writes_active_ == 0) {
+      // During the deferred window send HTTP/2 PING frames each second to
+      // keep the session looking like an active HTTPS/2 connection.
+      Packet *pkt = network_->packet_pool().AllocPacketFromPool();
+      if (pkt) {
+        static const uint payload_size = 17;
+        pkt->data[0] = 0x17; pkt->data[1] = 0x03; pkt->data[2] = 0x03;
+        pkt->data[3] = 0x00; pkt->data[4] = payload_size;
+        pkt->data[5]  = 0x00; pkt->data[6]  = 0x00; pkt->data[7]  = 0x08;
+        pkt->data[8]  = 0x06; pkt->data[9]  = 0x00;
+        pkt->data[10] = 0x00; pkt->data[11] = 0x00;
+        pkt->data[12] = 0x00; pkt->data[13] = 0x00;
+        OsGetRandomBytes(pkt->data + 14, 8);
+        pkt->size = 5 + payload_size;
+        pkt->prepared = true;
+        WritePacket(pkt);
+      }
+    }
   }
 
   if (state_ == STATE_CONNECTED) {
