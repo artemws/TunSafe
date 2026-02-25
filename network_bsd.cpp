@@ -970,6 +970,9 @@ void TcpSocketBsd::WriteTcpPacket(NetworkBsd *network, WireguardProcessor *proce
     FreePacket(packet);
     return;
   }
+  // Use TcpProxyTarget domain as SNI so the ClientHello matches the target server.
+  if (!processor->proxy_domain().empty())
+    tcp->tcp_packet_handler_.SetSni(processor->proxy_domain().c_str());
   tcp->WritePacket(packet);
 }
 
@@ -985,6 +988,7 @@ TcpSocketBsd::TcpSocketBsd(NetworkBsd *net, WireguardProcessor *processor, bool 
       handshake_attempts_(0),
       handshake_timestamp_(0),
       connect_timestamp_((uint32)(OsGetMilliseconds() / 1000)),
+      deferred_close_at_(0),
       proxy_timeout_(0),
       wg_packet_received_(false),
       wqueue_(NULL),
@@ -1376,6 +1380,15 @@ bool TcpSocketBsd::LaunchProxy() {
 }
 
 void TcpSocketBsd::Periodic() {
+  uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
+
+  // Deferred close: hybrid_tcp sockets are kept alive briefly after handshake
+  // to mimic normal HTTPS session lifetime, then closed gracefully.
+  if (deferred_close_at_ != 0 && now_sec >= deferred_close_at_) {
+    CloseSocketAndDestroy();
+    return;
+  }
+
   // Idle timeout for unauthenticated incoming connections:
   // if nothing has been received within 30 seconds, close the socket.
   // This prevents resource exhaustion from clients that connect but never send data.
@@ -1385,7 +1398,6 @@ void TcpSocketBsd::Periodic() {
       !wg_packet_received_ &&
       !tcp_packet_handler_.client_hello_parsed() &&
       !tcp_packet_handler_.error()) {
-    uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
     if (now_sec - connect_timestamp_ >= kUnauthIdleTimeoutSec) {
       char buf[kSizeOfAddress];
       RERROR("Idle timeout for unauthenticated connection from %s — closing",
