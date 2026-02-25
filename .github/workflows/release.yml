@@ -6,29 +6,10 @@ on:
       - 'v*'
   workflow_dispatch:
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CHANGES vs previous run:
-#
-# FIX - Android linker "undefined symbol: CreateTunsafePlugin":
-#   Root cause: tunsafe_wg_plugin.cpp is designed for amalgam-only builds
-#   (it contains #pragma once and is meant to be #include'd, not compiled as
-#   a standalone TU). When compiled separately by NDK/CMake, the symbol
-#   CreateTunsafePlugin was not consistently visible to the linker.
-#
-#   CORRECT FIX:
-#   - Remove tunsafe_wg_plugin.cpp from CMakeLists CORE_SOURCES entirely.
-#   - Remove the PluginDelegate inheritance from AndroidBackend.
-#   - Pass nullptr to processor_.dev().SetPlugin() — safe because
-#     WireguardProcessor null-checks before using the plugin pointer.
-#   - No more patching of tunsafe_wg_plugin.h needed.
-#
-# patch-sources now only patches ip_to_peer_map.cpp (offsetof VLA fix).
-# ─────────────────────────────────────────────────────────────────────────────
-
 jobs:
 
   # ─────────────────────────────────────────────────────────────────
-  # Патч ip_to_peer_map.cpp — offsetof с VLA не работает в GCC 10+
+  # Патч исходников
   # ─────────────────────────────────────────────────────────────────
   patch-sources:
     name: Patch sources
@@ -45,28 +26,20 @@ jobs:
 
       - name: Patch wireguard.cpp (PacketResultd typo)
         run: |
-          # GCC 13 rejects the typo 'PacketResultd' even inside #if WITH_SHORT_HEADERS=0.
-          # sed is idempotent - safe even if already fixed in the repo.
           sed -i 's/WireguardProcessor::PacketResultd/WireguardProcessor::PacketResult/g' wireguard.cpp
           echo "wireguard.cpp line 710: $(sed -n '710p' wireguard.cpp)"
 
       - name: Ensure CreateTunsafePlugin is defined
         run: |
-          # Some repo versions of tunsafe_wg_plugin.cpp only contain an empty stub
-          # or #pragma once without a real function body.  If CreateTunsafePlugin
-          # is not defined (only declared), append a minimal implementation so the
-          # linker can resolve the symbol in both Linux static and Android NDK builds.
           if ! grep -q 'CreateTunsafePlugin[^;]*{' tunsafe_wg_plugin.cpp; then
             echo "" >> tunsafe_wg_plugin.cpp
-            echo "// Auto-generated stub: CreateTunsafePlugin body missing from this repo." >> tunsafe_wg_plugin.cpp
             echo '#include "tunsafe_wg_plugin.h"' >> tunsafe_wg_plugin.cpp
             echo '#include "wireguard.h"' >> tunsafe_wg_plugin.cpp
             echo 'TunsafePlugin *CreateTunsafePlugin(PluginDelegate *del, WireguardProcessor *wgp) { return nullptr; }' >> tunsafe_wg_plugin.cpp
             echo "Appended CreateTunsafePlugin stub"
           else
-            echo "CreateTunsafePlugin already defined — no patch needed"
+            echo "CreateTunsafePlugin already defined"
           fi
-          grep -n "CreateTunsafePlugin" tunsafe_wg_plugin.cpp
 
       - uses: actions/upload-artifact@v4
         with:
@@ -77,7 +50,7 @@ jobs:
             tunsafe_wg_plugin.cpp
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux x86_64 — static + ASM
+  # Linux x86_64
   # ─────────────────────────────────────────────────────────────────
   build-linux-x86_64:
     name: Linux x86_64 (static + ASM)
@@ -117,7 +90,7 @@ jobs:
           path: tunsafe-linux-x86_64
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux i686 — static
+  # Linux i686
   # ─────────────────────────────────────────────────────────────────
   build-linux-i686:
     name: Linux i686 (static)
@@ -148,11 +121,7 @@ jobs:
           path: tunsafe-linux-i686
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux ARMv7 — apt cross-compiler (gnueabihf, hard-float)
-  # dockcross/linux-armv7 dropped: uses gnueabi (soft-float) and its static
-  # linker exits with error 127 on getaddrinfo. The Ubuntu apt toolchain
-  # (gnueabihf) is simpler, more reliable, and targets hard-float ABI
-  # which is correct for Raspberry Pi and most modern ARMv7 boards.
+  # Linux ARMv7
   # ─────────────────────────────────────────────────────────────────
   build-linux-armv7:
     name: Linux ARMv7 (static)
@@ -185,9 +154,7 @@ jobs:
           path: tunsafe-linux-armv7
 
   # ─────────────────────────────────────────────────────────────────
-  # Linux AArch64 — apt cross-compiler
-  # dockcross/linux-arm64 dropped: ld.bfd exits 127 on getaddrinfo
-  # with -static (same issue as ARMv7 dockcross toolchain).
+  # Linux AArch64
   # ─────────────────────────────────────────────────────────────────
   build-linux-aarch64:
     name: Linux AArch64/ARMv8 (static)
@@ -219,7 +186,7 @@ jobs:
           path: tunsafe-linux-aarch64
 
   # ─────────────────────────────────────────────────────────────────
-  # Windows MSVC — GUI
+  # Windows MSVC
   # ─────────────────────────────────────────────────────────────────
   build-windows-msvc:
     name: Windows MSVC x64 (GUI)
@@ -231,8 +198,6 @@ jobs:
         shell: pwsh
         run: |
           choco install nasm --no-progress -y
-          # choco installs NASM as EXE into its own dir, not chocolatey\bin.
-          # Find it and shim to c:\dev\nasm\nasm.exe (hardcoded in nasm.targets).
           $nasm = Get-ChildItem "C:\Program Files\NASM","C:\NASM" -Filter nasm.exe -Recurse -ErrorAction SilentlyContinue |
                   Select-Object -First 1 -ExpandProperty FullName
           if (-not $nasm) {
@@ -243,51 +208,29 @@ jobs:
           New-Item -ItemType Directory -Force "C:\dev\nasm" | Out-Null
           Copy-Item $nasm "C:\dev\nasm\nasm.exe"
           Write-Host "NASM version: $(& 'C:\dev\nasm\nasm.exe' -v)"
-          # curve25519-x64-win.asm uses # for comments (GAS/YASM syntax).
-          # NASM expects ; — replace standalone # comment lines with ;
           $f = "crypto\curve25519\curve25519-x64-win.asm"
           (Get-Content $f) -replace '^#\s*(.*)', '; $1' | Set-Content $f
-          Write-Host "Patched ${f}"
-          Get-Content $f | Select-Object -Skip 9 -First 6
-          # util_win32.cpp:155 returns `false` from a uint8* function — fix to NULL
           (Get-Content util_win32.cpp) -replace 'if \(!f\) return false;', 'if (!f) return NULL;' |
             Set-Content util_win32.cpp
-          Write-Host "Patched util_win32.cpp"
-          # wireguard.cpp:710 has a typo 'PacketResultd' — MSVC rejects it even
-          # inside #if WITH_SHORT_HEADERS=0 blocks.
           (Get-Content wireguard.cpp) -replace 'PacketResultd', 'PacketResult' |
             Set-Content wireguard.cpp
-          Write-Host "Patched wireguard.cpp (PacketResultd -> PacketResult)"
-          # tunsafe_wg_plugin.cpp must start with #include "stdafx.h" for MSVC PCH.
-          # If the repo has a version that starts with #pragma once, prepend the include.
           $pg = Get-Content tunsafe_wg_plugin.cpp -First 1
           if ($pg -notmatch 'stdafx') {
             $lines = Get-Content tunsafe_wg_plugin.cpp
             '#include "stdafx.h"', '' + $lines | Set-Content tunsafe_wg_plugin.cpp
-            Write-Host "Prepended stdafx.h to tunsafe_wg_plugin.cpp"
           }
-          # If CreateTunsafePlugin is not defined in tunsafe_wg_plugin.cpp
-          # (some repo versions only have a stub/header), add a null stub so the
-          # linker can resolve the symbol.  The Windows GUI does not use the 2FA
-          # plugin at runtime, so returning nullptr is safe.
           $wgp = Get-Content tunsafe_wg_plugin.cpp -Raw
           if ($wgp -notmatch 'CreateTunsafePlugin[^;]+\{') {
-            # Write stub as separate .cpp with proper includes (here-string avoided
-            # to keep YAML valid; use individual Set-Content calls instead).
             $lines = (
               '#include "stdafx.h"',
               '#include "tunsafe_wg_plugin.h"',
               '#include "wireguard.h"',
-              '// Stub: definition absent from this repo version.',
               'TunsafePlugin *CreateTunsafePlugin(PluginDelegate *del, WireguardProcessor *wgp) { return nullptr; }'
             )
             $lines | Set-Content tunsafe_wg_plugin_stub.cpp -Encoding UTF8
-            Write-Host "Wrote tunsafe_wg_plugin_stub.cpp"
-            # Inject into vcxproj so MSVC compiles and links it
             $vcx = Get-Content TunSafe.vcxproj -Raw
             $vcx = $vcx -replace '(<ClCompile Include="tunsafe_wg_plugin\.cpp" />)', '$1<ClCompile Include="tunsafe_wg_plugin_stub.cpp" />'
             $vcx | Set-Content TunSafe.vcxproj -Encoding UTF8
-            Write-Host "Patched TunSafe.vcxproj"
           }
       - name: Build x64
         run: |
@@ -327,9 +270,8 @@ jobs:
           name: tunsafe-windows-msvc-win32
           path: dist\Win32\
 
-
   # ─────────────────────────────────────────────────────────────────
-  # Android NDK — сборка libnative-lib.so
+  # Android NDK
   # ─────────────────────────────────────────────────────────────────
   build-android:
     name: Android NDK (${{ matrix.abi }})
@@ -358,20 +300,6 @@ jobs:
           ndk-version: r26d
           add-to-path: true
 
-      - name: Patch network_android.cpp (OnConnected signature)
-        run: |
-          # OnConnected signature changed to OnConnected(WgPeer *peer) —
-          # patch the Android backend to match.
-          sed -i \
-            's/void OnConnected() override/void OnConnected(WgPeer *peer) override/' \
-            android/network_android.cpp
-          # Also patch the implementation body if it exists without the parameter
-          sed -i \
-            's/void AndroidBackend::OnConnected()/void AndroidBackend::OnConnected(WgPeer *peer)/' \
-            android/network_android.cpp
-          echo "network_android.cpp OnConnected lines:"
-          grep -n "OnConnected" android/network_android.cpp
-
       - name: Build libnative-lib.so (${{ matrix.abi }})
         env:
           NDK: ${{ steps.setup-ndk.outputs.ndk-path }}
@@ -396,7 +324,7 @@ jobs:
           path: build/android/libs/${{ matrix.abi }}/libnative-lib.so
 
   # ─────────────────────────────────────────────────────────────────
-  # Android — инжект .so в APK и подпись
+  # Android APK
   # ─────────────────────────────────────────────────────────────────
   assemble-android-apk:
     name: Assemble Android APK
@@ -405,9 +333,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Download each ABI artifact directly into its final location.
-      # This avoids path-preservation issues with upload-artifact v4 that
-      # cause nested paths like so-arm64-v8a/build/android/libs/arm64-v8a/...
       - name: Download arm64-v8a
         uses: actions/download-artifact@v4
         with:
@@ -431,8 +356,6 @@ jobs:
           echo "=== Raw download tree ==="
           find build/android/libs -type f | sort
           echo "==="
-          # upload-artifact v4 may preserve subdirectory paths from the upload source.
-          # Flatten: move any libnative-lib.so into the correct ABI directory.
           for abi in arm64-v8a armeabi-v7a x86_64; do
             expected="build/android/libs/${abi}/libnative-lib.so"
             if [ ! -f "$expected" ]; then
@@ -443,9 +366,8 @@ jobs:
               fi
             fi
           done
-          echo "=== Final libs ==="
           find build/android/libs -name "*.so" | sort
-          find build/android/libs -name "libnative-lib.so" | grep -q . || { echo "ERROR: no .so files found"; exit 1; }
+          find build/android/libs -name "libnative-lib.so" | grep -q . || { echo "ERROR: no .so files"; exit 1; }
 
       - name: Install zipalign + apksigner
         run: sudo apt-get update -q && sudo apt-get install -y zipalign apksigner
