@@ -36,3 +36,6 @@
 #include "benchmark.cpp"
 #endif
 
+#if defined(OS_ANDROID) && defined(WITH_NETWORK_BSD)
+#include "tunsafe_android.cpp"
+#endif
