@@ -745,8 +745,12 @@ void TunsafeBackendBsdImpl::CloseOutgoingTcpForAddr(const IpAddr &addr) {
   for (TcpSocketBsd *tcp = network_.tcp_sockets(); tcp; tcp = tcp->next()) {
     if (tcp->endpoint_protocol() == kPacketProtocolTcp &&
         CompareIpAddr(&tcp->endpoint(), &addr) == 0) {
-      RINFO("hybrid_tcp: closing TCP socket to %s after handshake complete", PrintIpAddr(addr, buf));
-      delete tcp;
+      // Defer close by a random 2-8 seconds so the TCP session lifetime
+      // looks more like a real HTTPS exchange and less like an instant tunnel.
+      uint8 rnd; OsGetRandomBytes(&rnd, 1);
+      uint32 delay = 2 + (rnd % 7);  // 2..8 seconds
+      tcp->SetDeferredClose((uint32)(OsGetMilliseconds() / 1000) + delay);
+      RINFO("hybrid_tcp: TCP to %s will close in %us", PrintIpAddr(addr, buf), delay);
       return;
     }
   }
