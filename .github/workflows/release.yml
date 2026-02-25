@@ -232,6 +232,53 @@ jobs:
             $vcx = $vcx -replace '(<ClCompile Include="tunsafe_wg_plugin\.cpp" />)', '$1<ClCompile Include="tunsafe_wg_plugin_stub.cpp" />'
             $vcx | Set-Content TunSafe.vcxproj -Encoding UTF8
           }
+      - name: Patch network_win32.h (remove duplicate TcpSocketWin32/TcpSocketQueue)
+        shell: pwsh
+        run: |
+          # network_win32_tcp.h (наш новый файл) объявляет TcpSocketWin32 и TcpSocketQueue.
+          # Оригинальный network_win32.h тоже содержит эти классы → C2011 redefinition.
+          # Решение: удаляем классы из network_win32.h и добавляем #include "network_win32_tcp.h".
+          $h = Get-Content network_win32.h -Raw
+
+          # Уже пропатчен?
+          if ($h -match '#include "network_win32_tcp\.h"') {
+            Write-Host "network_win32.h already patched"
+          } else {
+            # Добавляем include после блока #include-ов в начале файла
+            $h = $h -replace '((?:#include "[^"]+"\r?\n)+)', "`$1#include `"network_win32_tcp.h`"`n"
+
+            # Удаляем определение class TcpSocketWin32 { ... };
+            # Используем простой маркер: ищем строку "class TcpSocketWin32" и удаляем до парного "};""
+            # PowerShell regex с ленивым квантором через [^]* невозможен для вложенных фигурных скобок,
+            # поэтому используем скрипт с счётчиком скобок.
+            function Remove-ClassDef($text, $className) {
+              $start = $text.IndexOf("class $className")
+              if ($start -lt 0) { return $text }
+              $braceStart = $text.IndexOf('{', $start)
+              $depth = 0; $i = $braceStart
+              while ($i -lt $text.Length) {
+                if ($text[$i] -eq '{') { $depth++ }
+                elseif ($text[$i] -eq '}') {
+                  $depth--
+                  if ($depth -eq 0) {
+                    $end = $text.IndexOf(';', $i) + 1
+                    while ($end -lt $text.Length -and $text[$end] -in @("`r","`n"," ","`t")) { $end++ }
+                    return $text.Substring(0, $start) + $text.Substring($end)
+                  }
+                }
+                $i++
+              }
+              return $text
+            }
+
+            $h = Remove-ClassDef $h 'TcpSocketWin32'
+            $h = Remove-ClassDef $h 'TcpSocketQueue'
+            $h | Set-Content network_win32.h -Encoding UTF8 -NoNewline
+            Write-Host "Patched network_win32.h: removed duplicate class defs, added include"
+          }
+          # Verify
+          Select-String -Path network_win32.h -Pattern 'network_win32_tcp'
+
       - name: Build x64
         run: |
           msbuild TunSafe.sln `
