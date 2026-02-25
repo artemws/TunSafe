@@ -731,11 +731,13 @@ void NetworkWin32::ThreadMain() {
       for (TcpSocketWin32 *tcp = tcp_socket_; tcp; tcp = tcp->next_) {
         if (tcp->endpoint_protocol_ == kPacketProtocolTcp &&
             CompareIpAddr(&tcp->endpoint_, &close_addr) == 0) {
-          tcp->CloseSocket();
+          // Defer by 2-8 random seconds to mimic natural HTTPS session lifetime.
+          uint8 rnd; OsGetRandomBytes(&rnd, 1);
+          tcp->deferred_close_at_ = (uint32)(OsGetMilliseconds() / 1000) + 2 + (rnd % 7);
           break;
         }
       }
-    }
+}
 
     // TODO: In the future, don't process every socket here, only
     // those sockets that requested it.
@@ -746,9 +748,12 @@ void NetworkWin32::ThreadMain() {
     packet_pool_.FreeSomePackets();
 
     ULONG num_entries = 0;
-    if (!GetQueuedCompletionStatusEx(completion_port_handle_, entries, kUdpGetQueuedCompletionStatusSize, &num_entries, INFINITE, FALSE)) {
-      RINFO("GetQueuedCompletionStatusEx failed.");
-      break;
+    // Use a 1-second timeout so deferred TCP closes fire promptly.
+    if (!GetQueuedCompletionStatusEx(completion_port_handle_, entries, kUdpGetQueuedCompletionStatusSize, &num_entries, 1000, FALSE)) {
+      if (GetLastError() != WAIT_TIMEOUT) {
+        RINFO("GetQueuedCompletionStatusEx failed.");
+        break;
+      }
     }
     for (ULONG i = 0; i < num_entries; i++) {
       if (entries[i].lpOverlapped) {
@@ -2006,6 +2011,10 @@ bool TunsafeRunner::Start() {
   
   if (!wg_proc_.Start())
     return false;
+
+  // Use TcpProxyTarget domain as SNI for outgoing TLS ClientHello.
+  if (!wg_proc_.proxy_domain().empty())
+    tcp_socket_queue_.SetSni(wg_proc_.proxy_domain().c_str());
 
   backend_->SetPublicKey(wg_proc_.dev().public_key());
 
