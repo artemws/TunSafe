@@ -240,13 +240,18 @@ size_t TcpPacketHandler::CreateTls13ClientHello(uint8 *dst) {
   *dst++=g_ext1; *dst++=g_ext1; *dst++=0x00; *dst++=0x00;
 
   // -- server_name (SNI, 0x0000) – always first real ext -------------------
-  static const uint8 sni[] = {
-    0x00,0x00, 0x00,0x16, 0x00,0x14, 0x00,0x00,0x11,
-    // "enabled.tls13.com"
-    0x65,0x6e,0x61,0x62,0x6c,0x65,0x64,0x2e,
-    0x74,0x6c,0x73,0x31,0x33,0x2e,0x63,0x6f,0x6d,
-  };
-  WEXT(sni);
+  {
+    // Use configured SNI (from TcpProxyTarget) or fall back to a default.
+    const char *sni_host = sni_.empty() ? "www.cloudflare.com" : sni_.c_str();
+    size_t sni_len = strlen(sni_host);
+    // ext type (2) + ext len (2) + list len (2) + name type (1) + name len (2) + name
+    *dst++ = 0x00; *dst++ = 0x00;                          // ext type
+    WriteBE16(dst, (uint16)(sni_len + 5)); dst += 2;       // ext data length
+    WriteBE16(dst, (uint16)(sni_len + 3)); dst += 2;       // server_name_list length
+    *dst++ = 0x00;                                         // name_type = host_name
+    WriteBE16(dst, (uint16)sni_len);       dst += 2;       // name length
+    memcpy(dst, sni_host, sni_len);        dst += sni_len;
+  }
 
   // -- extended_master_secret (0x0017) -------------------------------------
   static const uint8 ems[] = { 0x00,0x17, 0x00,0x00 };
