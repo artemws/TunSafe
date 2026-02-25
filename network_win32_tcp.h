@@ -62,6 +62,7 @@ public:
   uint8 handshake_attempts;
   uint8 endpoint_protocol_;
   uint32 handshake_timestamp_;
+  uint32 deferred_close_at_;  // if non-zero, close at this monotonic second
 private:
 
   // The handle to the socket
@@ -96,6 +97,7 @@ public:
   ~TcpSocketQueue();
 
   void SetPacketHandler(PacketProcessor *packet_handler) { packet_handler_ = packet_handler; }
+  void SetSni(const char *sni) { sni_ = sni ? sni : ""; }
 
   virtual void OnQueuedItemEvent(QueuedItem *ow, uintptr_t extra) override;
   virtual void OnQueuedItemDelete(QueuedItem *ow) override;
@@ -112,6 +114,7 @@ private:
   PacketProcessor *packet_handler_;
 
   WgPacketObfuscator *obfuscator_;
+  std::string sni_;
 
   // Protects wqueue_
   Mutex wqueue_mutex_;
@@ -119,4 +122,3 @@ private:
   // Used for queueing things on the network instance
   QueuedItem queued_item_;
 };
-
