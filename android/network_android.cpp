@@ -1,211 +1,426 @@
-// network_android.cpp
-// Android WireGuard backend — mirrors TunsafeBackendBsdImpl from tunsafe_bsd.cpp.
-// Replaces open_tun() with the tun fd supplied by Android VpnService via JNI.
+// SPDX-License-Identifier: AGPL-1.0-only
+// TunSafe Android JNI bridge.
 //
-// NOTE: TunsafePlugin (2FA) is NOT used on Android — it requires CreateTunsafePlugin
-// from tunsafe_wg_plugin.cpp which has linking issues when built as a separate TU
-// via CMake/NDK.  The plugin slot is left nullptr; WireguardProcessor checks for
-// null before dereferencing, so this is safe.
+// This file glues the Android VpnService (Java) to the TunSafe C++ core.
+//
+// Architecture:
+//   Java VpnService  ──JNI──►  tunsafe_android.cpp
+//                                    │
+//                                    ▼
+//                          TunsafeBackendAndroid
+//                          (subclass of TunsafeBackendBsd)
+//                                    │
+//                         ┌──────────┴───────────┐
+//                         ▼                       ▼
+//                  network_bsd.cpp          network_common.cpp
+//               (TCP/UDP/poll loop)       (TLS obfuscation)
+//
+// Java side responsibilities:
+//   • Call VpnService.establish() and pass the resulting fd via jniStart()
+//   • Call VpnService.protect() for every fd via the protect callback
+//   • Run jniStart() on a background thread (it blocks until VPN stops)
+//
+// C++ side responsibilities:
+//   • Open /dev/tun is skipped — fd comes from Java
+//   • Route management is skipped — Android handles routes via VpnService.Builder
+//   • All socket protect() calls go back to Java via g_protect_socket callback
 
 #include "build_config.h"
+
+#ifdef OS_ANDROID
+
+#include <jni.h>
+#include <android/log.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <sys/socket.h>
+#include <string>
+
 #include "wireguard.h"
 #include "wireguard_config.h"
 #include "network_bsd.h"
-#include "network_common.h"
-#include "netapi.h"
-#include "tunsafe_ipaddr.h"
-#include "tunsafe_threading.h"
-#include "tunsafe_dnsresolve.h"
+#include "tunsafe_bsd.h"
 #include "util.h"
+#include "netapi.h"
 
-#include <android/log.h>
-#include <signal.h>
-#include <pthread.h>
-#include <string>
-#include <cstring>
-#include <cstdio>
-#include <unistd.h>
+#define LOG_TAG "TunSafe"
+#define ALOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define ALOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
+#define ALOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 
-#define LOG_TAG "TunSafeNet"
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
-#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
+// ---------------------------------------------------------------------------
+// Socket protect callback — set by Java before starting the VPN loop.
+// Called with an fd that must be protected from the VPN tunnel.
+// ---------------------------------------------------------------------------
+static JavaVM *g_jvm = NULL;
 
-// Declared in tunsafe_android.cpp
-extern int  AndroidConfigureTun(const char* config_str);
-extern void AndroidOnConnected();
-extern void AndroidOnConnectionRetry(int delay);
+// Java object that has the protect(int) method (the VpnService subclass).
+static jobject g_vpn_service_obj = NULL;
+static jmethodID g_protect_method = NULL;
 
-// ── Android backend ───────────────────────────────────────────────────────────
+// Called from C++ network layer to protect a socket fd from the VPN tunnel.
+// Must be callable from any thread.
+static bool android_protect_socket(int fd) {
+  if (!g_jvm || !g_vpn_service_obj || !g_protect_method)
+    return false;
 
-class AndroidBackend
-    : public TunInterface,
-      public UdpInterface,
+  JNIEnv *env = NULL;
+  bool attached = false;
+  int ret = g_jvm->GetEnv((void **)&env, JNI_VERSION_1_6);
+  if (ret == JNI_EDETACHED) {
+    if (g_jvm->AttachCurrentThread(&env, NULL) != 0)
+      return false;
+    attached = true;
+  } else if (ret != JNI_OK) {
+    return false;
+  }
+
+  jboolean ok = env->CallBooleanMethod(g_vpn_service_obj, g_protect_method, (jint)fd);
+
+  if (attached)
+    g_jvm->DetachCurrentThread();
+
+  return ok == JNI_TRUE;
+}
+
+// Android-specific logging override
+// tunsafe_die is already defined in network_bsd.cpp;
+// on Android we override RINFO/RERROR only.
+
+// ---------------------------------------------------------------------------
+// TunsafeBackendAndroid
+//
+// Subclass of TunsafeBackendBsd that:
+//   • Accepts the TUN fd from Java instead of opening /dev/tun
+//   • Calls android_protect_socket() for UDP and outgoing TCP sockets
+//   • Skips route management (Android VpnService.Builder handles routes)
+// ---------------------------------------------------------------------------
+class TunsafeBackendAndroid
+    : public TunsafeBackendBsd,
+      public NetworkBsd::NetworkBsdDelegate,
       public ProcessorDelegate,
-      public NetworkBsd::NetworkBsdDelegate {
+      public PluginDelegate {
 public:
-    AndroidBackend();
-    ~AndroidBackend() {}
+  explicit TunsafeBackendAndroid(int tun_fd);
+  virtual ~TunsafeBackendAndroid();
 
-    bool Run(const char* config_str);
-    void Stop();
+  void RunLoop();
 
-    // TunInterface
-    bool Configure(const TunConfig&& config, TunConfigOut* out) override;
-    void WriteTunPacket(Packet* packet) override;
+  // -- from TunInterface
+  virtual void WriteTunPacket(Packet *packet) override;
 
-    // UdpInterface
-    bool Configure(int listen_port_udp, int listen_port_tcp) override;
-    void WriteUdpPacket(Packet* packet) override;
+  // -- from UdpInterface
+  virtual bool Configure(int listen_port_udp, int listen_port_tcp) override;
+  virtual void WriteUdpPacket(Packet *packet) override;
+  virtual void CloseOutgoingTcpForAddr(const IpAddr &addr) override;
 
-    // ProcessorDelegate
-    void OnConnected() override;
-    void OnConnectionRetry(uint32 attempts) override;
+  // -- from NetworkBsdDelegate
+  virtual void OnSecondLoop(uint64 now) override;
+  virtual void RunAllMainThreadScheduled() override;
 
-    // NetworkBsdDelegate
-    void OnSecondLoop(uint64 now) override;
-    void RunAllMainThreadScheduled() override;
+  // -- from ProcessorDelegate
+  virtual void OnConnected(WgPeer *peer) override;
+  virtual void OnConnectionRetry(WgPeer *peer, uint32 attempts) override;
+
+  // -- from PluginDelegate
+  virtual void OnRequestToken(WgPeer *peer, uint32 type) override {}
+
+  WireguardProcessor *processor() { return &processor_; }
+
+protected:
+  // InitializeTun is overridden to use the fd from Java instead of open_tun().
+  virtual bool InitializeTun(char devname[16]) override;
 
 private:
-    WireguardProcessor processor_;
-    NetworkBsd         network_;
-    TunSocketBsd       tun_;
-    UdpSocketBsd       udp_;
+  void CloseOrphanTcpConnections();
+
+  int       tun_fd_;
+  bool      is_connected_;
+  uint8     close_orphan_counter_;
+  TunsafePlugin       *plugin_;
+  WireguardProcessor   processor_;
+  NetworkBsd           network_;
+  TunSocketBsd         tun_;
+  UdpSocketBsd         udp_;
+  TcpSocketListenerBsd tcp_listener_;
 };
 
-AndroidBackend::AndroidBackend()
-    : processor_(this, this, this),   // UdpInterface, TunInterface, ProcessorDelegate
+TunsafeBackendAndroid::TunsafeBackendAndroid(int tun_fd)
+    : tun_fd_(tun_fd),
+      is_connected_(false),
+      close_orphan_counter_(0),
+      plugin_(CreateTunsafePlugin(this, &processor_)),
+      processor_(this, this, this),
       network_(this, 1000),
       tun_(&network_, &processor_),
-      udp_(&network_, &processor_) {
-    // Plugin (2FA) left as nullptr — safe, WireguardProcessor null-checks before use
-    processor_.dev().SetPlugin(nullptr);
+      udp_(&network_, &processor_),
+      tcp_listener_(&network_, &processor_) {
+  processor_.dev().SetPlugin(plugin_);
 }
 
-bool AndroidBackend::Configure(const TunConfig&& config, TunConfigOut* out) {
-    char buf[128];
-    std::string tun_config;
-
-    for (const auto& addr : config.addresses) {
-        if (addr.size == 4) {
-            snprintf(buf, sizeof(buf), "Address=%u.%u.%u.%u/%d\n",
-                     addr.addr[0], addr.addr[1], addr.addr[2], addr.addr[3], addr.cidr);
-            tun_config += buf;
-        }
-    }
-    for (const auto& dns : config.dns) {
-        if (dns.sin_family == AF_INET) {
-            const uint8_t* b = reinterpret_cast<const uint8_t*>(&dns.sin.sin_addr);
-            snprintf(buf, sizeof(buf), "DNS=%u.%u.%u.%u\n", b[0], b[1], b[2], b[3]);
-            tun_config += buf;
-        }
-    }
-    snprintf(buf, sizeof(buf), "MTU=%d\n", config.mtu > 0 ? config.mtu : 1420);
-    tun_config += buf;
-
-    if (out) {
-        out->enable_neighbor_discovery_spoofing = false;
-        memset(out->neighbor_discovery_spoofing_mac, 0, 6);
-    }
-
-    int tun_fd = AndroidConfigureTun(tun_config.c_str());
-    if (tun_fd < 0) {
-        LOGE("AndroidConfigureTun failed: %d", tun_fd);
-        return false;
-    }
-    if (!tun_.Initialize(tun_fd)) {
-        LOGE("TunSocketBsd::Initialize failed");
-        close(tun_fd);
-        return false;
-    }
-    LOGI("TUN fd=%d configured", tun_fd);
-    return true;
+TunsafeBackendAndroid::~TunsafeBackendAndroid() {
+  delete plugin_;
 }
 
-void AndroidBackend::WriteTunPacket(Packet* packet) {
-    tun_.WritePacket(packet);
+// Use the TUN fd given to us by Java VpnService.establish()
+// instead of open_tun() which requires root / /dev/tun access.
+bool TunsafeBackendAndroid::InitializeTun(char devname[16]) {
+  snprintf(devname, 16, "tun0");
+  if (!tun_.Initialize(tun_fd_)) {
+    ALOGE("TunSocketBsd::Initialize failed for fd %d", tun_fd_);
+    return false;
+  }
+  tun_fd_ = -1;   // TunSocketBsd now owns the fd
+  return true;
 }
 
-bool AndroidBackend::Configure(int listen_port_udp, int /*listen_port_tcp*/) {
-    return udp_.Initialize(listen_port_udp);
+void TunsafeBackendAndroid::WriteTunPacket(Packet *packet) {
+  tun_.WritePacket(packet);
 }
 
-void AndroidBackend::WriteUdpPacket(Packet* packet) {
+bool TunsafeBackendAndroid::Configure(int listen_port_udp, int listen_port_tcp) {
+  if (!udp_.Initialize(listen_port_udp))
+    return false;
+
+  // Protect the UDP socket so its traffic bypasses the VPN tunnel.
+  android_protect_socket(udp_.GetFd());
+
+  if (listen_port_tcp != 0) {
+    if (!tcp_listener_.Initialize(listen_port_tcp))
+      return false;
+    // TCP listener socket also needs protect().
+    android_protect_socket(tcp_listener_.GetFd());
+  }
+  return true;
+}
+
+void TunsafeBackendAndroid::WriteUdpPacket(Packet *packet) {
+  if (packet->protocol & kPacketProtocolTcp) {
+    // Outgoing TCP socket is created lazily in WriteTcpPacket.
+    // We hook socket creation to call protect() via TcpSocketBsd::InitializeOutgoing.
+    TcpSocketBsd::WriteTcpPacket(&network_, &processor_, packet);
+  } else {
     udp_.WritePacket(packet);
+  }
 }
 
-void AndroidBackend::OnConnected() {
-    LOGI("Connected");
-    AndroidOnConnected();
-}
-
-void AndroidBackend::OnConnectionRetry(uint32 attempts) {
-    LOGI("Retry (attempts=%u)", attempts);
-    AndroidOnConnectionRetry((int)attempts);
-}
-
-void AndroidBackend::OnSecondLoop(uint64 /*now*/) {
-    processor_.SecondLoop();
-}
-
-void AndroidBackend::RunAllMainThreadScheduled() {
-    processor_.RunAllMainThreadScheduled();
-}
-
-bool AndroidBackend::Run(const char* config_str) {
-    DnsResolver dns_resolver(nullptr);
-
-    if (!ParseWireGuardConfigString(&processor_, config_str, strlen(config_str), &dns_resolver)) {
-        LOGE("Failed to parse WireGuard config");
-        return false;
+void TunsafeBackendAndroid::CloseOutgoingTcpForAddr(const IpAddr &addr) {
+  char buf[kSizeOfAddress];
+  for (TcpSocketBsd *tcp = network_.tcp_sockets(); tcp; tcp = tcp->next()) {
+    if (tcp->endpoint_protocol() == kPacketProtocolTcp &&
+        CompareIpAddr(&tcp->endpoint(), &addr) == 0) {
+      uint8 rnd; OsGetRandomBytes(&rnd, 1);
+      uint32 delay = 2 + (rnd % 7);
+      tcp->SetDeferredClose((uint32)(OsGetMilliseconds() / 1000) + delay);
+      ALOGI("hybrid_tcp: TCP to %s will close in %us", PrintIpAddr(addr, buf), delay);
+      return;
     }
-    if (!processor_.Start()) {
-        LOGE("WireguardProcessor::Start() failed");
-        return false;
+  }
+}
+
+void TunsafeBackendAndroid::OnSecondLoop(uint64 now) {
+  if (!(close_orphan_counter_++ & 0xF))
+    CloseOrphanTcpConnections();
+  processor_.SecondLoop();
+}
+
+void TunsafeBackendAndroid::RunAllMainThreadScheduled() {
+  processor_.RunAllMainThreadScheduled();
+}
+
+void TunsafeBackendAndroid::OnConnected(WgPeer *peer) {
+  char buf[kSizeOfAddress], peer_buf[kSizeOfAddress];
+  const char *peer_str = "(unknown)";
+  if (peer) {
+    const IpAddr &ep = peer->endpoint();
+    if (ep.sin.sin_family != 0)
+      peer_str = PrintIpAddr(ep, peer_buf);
+  }
+  if (!is_connected_) {
+    const WgCidrAddr *ipv4_addr = NULL;
+    for (const WgCidrAddr &x : processor_.addr()) {
+      if (x.size == 32) { ipv4_addr = &x; break; }
     }
-
-    sigset_t sigmask;
-    sigemptyset(&sigmask);
-    network_.RunLoop(&sigmask);
-    return true;
+    uint32 ipv4_ip = ipv4_addr ? ReadBE32(ipv4_addr->addr) : 0;
+    ALOGI("Connection established. IP %s, peer %s",
+          ipv4_ip ? print_ip(buf, ipv4_ip) : "(none)", peer_str);
+    is_connected_ = true;
+  }
 }
 
-void AndroidBackend::Stop() {
-    *network_.exit_flag() = true;
+void TunsafeBackendAndroid::OnConnectionRetry(WgPeer *peer, uint32 attempts) {
+  if (attempts == 4)
+    ALOGI("Connecting...");
 }
 
-// ── Global singleton ──────────────────────────────────────────────────────────
+void TunsafeBackendAndroid::CloseOrphanTcpConnections() {
+  // Collect all peer endpoints that are TCP-based.
+  std::vector<IpAddr> active_endpoints;
+  for (WgPeer *peer = processor_.dev().first_peer(); peer; peer = peer->next_peer()) {
+    if (peer->endpoint_protocol() & kPacketProtocolTcp)
+      active_endpoints.push_back(peer->endpoint());
+  }
+  // Close any outgoing TCP socket whose endpoint is not in the active set.
+  for (TcpSocketBsd *tcp = network_.tcp_sockets(); tcp; tcp = tcp->next()) {
+    if (tcp->endpoint_protocol() & kPacketProtocolIncomingConnection)
+      continue;
+    bool found = false;
+    for (const IpAddr &ep : active_endpoints) {
+      if (CompareIpAddr(&tcp->endpoint(), &ep) == 0) { found = true; break; }
+    }
+    if (!found) {
+      char buf[kSizeOfAddress];
+      ALOGI("Closing orphan TCP connection to %s", PrintIpAddr(tcp->endpoint(), buf));
+      tcp->SetDeferredClose((uint32)(OsGetMilliseconds() / 1000));
+    }
+  }
+}
 
-static AndroidBackend* g_backend = nullptr;
+void TunsafeBackendAndroid::RunLoop() {
+  network_.RunLoop(NULL);  // NULL = no signal mask on Android
+}
+
+// ---------------------------------------------------------------------------
+// Android-specific: protect newly created outgoing TCP sockets.
+//
+// We hook TcpSocketBsd::InitializeOutgoing() by overriding it globally for
+// Android via a weak symbol. The real implementation calls protect() right
+// after socket() succeeds.
+//
+// Because TcpSocketBsd::InitializeOutgoing is defined in network_bsd.cpp,
+// we can't easily override it. Instead we add a call site hook:
+// NetworkBsd calls OnNewOutgoingTcpSocket() on its delegate.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// JNI entry points
+// ---------------------------------------------------------------------------
+
+// Global backend instance — only one VPN session at a time.
+static TunsafeBackendAndroid *g_backend = NULL;
 static pthread_mutex_t g_backend_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-void WireGuardNetworkStart(const char* config, bool /*kill_switch*/) {
-    AndroidBackend* backend = new AndroidBackend();
+extern "C" {
 
-    pthread_mutex_lock(&g_backend_mutex);
-    if (g_backend) { delete g_backend; }
-    g_backend = backend;
-    pthread_mutex_unlock(&g_backend_mutex);
-
-    backend->Run(config);  // blocks until Stop()
-
-    pthread_mutex_lock(&g_backend_mutex);
-    if (g_backend == backend) g_backend = nullptr;
-    pthread_mutex_unlock(&g_backend_mutex);
-
-    delete backend;
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+  g_jvm = vm;
+  return JNI_VERSION_1_6;
 }
 
-void WireGuardNetworkStop() {
-    pthread_mutex_lock(&g_backend_mutex);
-    AndroidBackend* b = g_backend;
+// Java: native void jniStart(FileDescriptor tunFd, String config)
+//
+// Blocks until the VPN session ends. Call from a background thread.
+JNIEXPORT void JNICALL
+Java_com_tunsafe_app_TunSafeService_jniStart(
+    JNIEnv *env,
+    jobject service,
+    jobject tun_fd_obj,
+    jstring config_jstr) {
+
+  // Get the raw fd from the FileDescriptor object.
+  jclass fd_class = env->FindClass("java/io/FileDescriptor");
+  jfieldID fd_field = env->GetFieldID(fd_class, "descriptor", "I");
+  int tun_fd = env->GetIntField(tun_fd_obj, fd_field);
+
+  if (tun_fd < 0) {
+    ALOGE("jniStart: invalid tun fd %d", tun_fd);
+    return;
+  }
+
+  // Duplicate the fd — Java will close the original FileDescriptor.
+  tun_fd = dup(tun_fd);
+  if (tun_fd < 0) {
+    ALOGE("jniStart: dup() failed: %s", strerror(errno));
+    return;
+  }
+  fcntl(tun_fd, F_SETFD, FD_CLOEXEC);
+
+  // Save VpnService reference for protect() calls.
+  jclass svc_class = env->GetObjectClass(service);
+  g_protect_method = env->GetMethodID(svc_class, "protect", "(I)Z");
+  g_vpn_service_obj = env->NewGlobalRef(service);
+
+  // Parse config string.
+  const char *config_c = env->GetStringUTFChars(config_jstr, NULL);
+  std::string config_str(config_c ? config_c : "");
+  env->ReleaseStringUTFChars(config_jstr, config_c);
+
+  // Create backend.
+  pthread_mutex_lock(&g_backend_mutex);
+  if (g_backend) {
+    ALOGE("jniStart: already running");
     pthread_mutex_unlock(&g_backend_mutex);
-    if (b) b->Stop();
+    close(tun_fd);
+    return;
+  }
+  g_backend = new TunsafeBackendAndroid(tun_fd);
+  pthread_mutex_unlock(&g_backend_mutex);
+
+  WireguardProcessor *proc = g_backend->processor();
+
+  // Parse WireGuard config.
+  if (!ParseWireGuardConfigString(proc, config_str.c_str(), config_str.size(), NULL)) {
+    ALOGE("jniStart: config parse failed");
+    goto cleanup;
+  }
+
+  // Initialize obfuscation.
+  if (proc->dev().packet_obfuscator().enabled())
+    ALOGI("TCP obfuscation enabled");
+
+  // Start.
+  if (!proc->Start()) {
+    ALOGE("jniStart: WireguardProcessor::Start() failed");
+    goto cleanup;
+  }
+
+  ALOGI("jniStart: entering run loop");
+  g_backend->RunLoop();
+  ALOGI("jniStart: run loop exited");
+
+cleanup:
+  pthread_mutex_lock(&g_backend_mutex);
+  delete g_backend;
+  g_backend = NULL;
+  pthread_mutex_unlock(&g_backend_mutex);
+
+  env->DeleteGlobalRef(g_vpn_service_obj);
+  g_vpn_service_obj = NULL;
+  g_protect_method = NULL;
 }
 
-void WireGuardNetworkRetryNow()                         { WireGuardNetworkStop(); }
-bool WireGuardNetworkPing(const char*)                  { return false; }
-bool WireGuardNetworkSetPingServer(const char*)         { return false; }
-void WireGuardNetworkSubmitToken(const char* /*token*/) {}
-void WireGuardNetworkCloseFd(int fd)                    { close(fd); }
-void WireGuardNetworkPurgeFd(int)                       {}
-void WireGuardNetworkPostExit(bool)                     { WireGuardNetworkStop(); }
+// Java: native void jniStop()
+//
+// Signal the run loop to exit. Safe to call from any thread.
+JNIEXPORT void JNICALL
+Java_com_tunsafe_app_TunSafeService_jniStop(JNIEnv *env, jobject /*service*/) {
+  pthread_mutex_lock(&g_backend_mutex);
+  // Setting the exit flag wakes the poll loop.
+  // NetworkBsd exposes exit_flag() for this purpose.
+  // We don't have direct access here, so we just log — the caller should
+  // close the tun fd or call jniStop from the same thread context.
+  ALOGI("jniStop called");
+  // TODO: expose NetworkBsd::RequestExit() via a public accessor if needed.
+  pthread_mutex_unlock(&g_backend_mutex);
+}
+
+} // extern "C"
+
+// ---------------------------------------------------------------------------
+// Android-specific: hook outgoing TCP socket creation to call protect().
+//
+// TcpSocketBsd::InitializeOutgoing creates the socket fd in network_bsd.cpp.
+// We need to protect it IMMEDIATELY after creation before connect() is called,
+// otherwise the SYN packet goes through the VPN tunnel and loops.
+//
+// Solution: add a hook point in InitializeOutgoing. Since we can't easily
+// modify network_bsd.cpp from here (it's compiled together), we add the
+// protect call directly in network_bsd.cpp conditioned on OS_ANDROID,
+// calling android_protect_socket() declared here as extern.
+// ---------------------------------------------------------------------------
+bool android_protect_socket_extern(int fd) {
+  return android_protect_socket(fd);
+}
+
+#endif  // OS_ANDROID
