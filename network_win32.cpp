@@ -697,6 +697,8 @@ NetworkWin32::NetworkWin32() : udp_socket_(this) {
   thread_ = NULL;
   completion_port_handle_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, NULL, 0);
   tcp_socket_ = NULL;
+  pending_close_valid_ = false;
+  InitializeCriticalSection(&pending_close_lock_);
 }
 
 NetworkWin32::~NetworkWin32() {
@@ -706,6 +708,7 @@ NetworkWin32::~NetworkWin32() {
     delete exch(socket, socket->next_);
 
   CloseHandle(completion_port_handle_);
+  DeleteCriticalSection(&pending_close_lock_);
 }
 
 DWORD WINAPI NetworkWin32::NetworkThread(void *x) {
@@ -718,6 +721,22 @@ void NetworkWin32::ThreadMain() {
   OVERLAPPED_ENTRY entries[kUdpGetQueuedCompletionStatusSize];
 
   while (!exit_thread_) {
+    // Process any pending TCP socket close requests posted from other threads.
+    EnterCriticalSection(&pending_close_lock_);
+    bool has_close = pending_close_valid_;
+    IpAddr close_addr = pending_close_addr_;
+    pending_close_valid_ = false;
+    LeaveCriticalSection(&pending_close_lock_);
+    if (has_close) {
+      for (TcpSocketWin32 *tcp = tcp_socket_; tcp; tcp = tcp->next_) {
+        if (tcp->endpoint_protocol_ == kPacketProtocolTcp &&
+            CompareIpAddr(&tcp->endpoint_, &close_addr) == 0) {
+          tcp->CloseSocket();
+          break;
+        }
+      }
+    }
+
     // TODO: In the future, don't process every socket here, only
     // those sockets that requested it.
     udp_socket_.DoIO();
@@ -797,14 +816,13 @@ void NetworkWin32::PostQueuedItem(QueuedItem *item) {
 }
 
 void NetworkWin32::CloseOutgoingTcpForAddr(const IpAddr &addr) {
-  // Has friend access to TcpSocketWin32 private members.
-  for (TcpSocketWin32 *tcp = tcp_socket_; tcp; tcp = tcp->next_) {
-    if (tcp->endpoint_protocol_ == kPacketProtocolTcp &&
-        CompareIpAddr(&tcp->endpoint_, &addr) == 0) {
-      tcp->CloseSocket();
-      return;
-    }
-  }
+  // Called from PacketProcessor thread — must not touch tcp_socket_ directly.
+  // Post the request; NetworkThread will process it at the top of its loop.
+  EnterCriticalSection(&pending_close_lock_);
+  pending_close_addr_  = addr;
+  pending_close_valid_ = true;
+  LeaveCriticalSection(&pending_close_lock_);
+  WakeUp();
 }
 
 /////////////////////////////////////////////////////////////////////////
