@@ -794,13 +794,21 @@ WgPeer *WgPeer::ParseMessageHandshakeResponse(WgDevice *dev, const Packet *packe
 
   WG_ACQUIRE_LOCK(peer->mutex_);
   if (peer->allow_endpoint_change_) {
-    // TODO: Why is this needed, if we are able to get a response for the handshake init
-    // packet then we already know its endpoint?
-    peer->endpoint_protocol_ = packet->protocol;
-    peer->endpoint_ = packet->addr;
-    if (!keypair->enabled_features[WG_FEATURE_HYBRID_TCP] || !peer->IsTransientDataEndpointActive()) {
-      peer->data_endpoint_protocol_ = peer->endpoint_protocol_;
-      peer->data_endpoint_ = peer->endpoint_;
+    if (keypair->enabled_features[WG_FEATURE_HYBRID_TCP] &&
+        (packet->protocol & kPacketProtocolTcp)) {
+      // Client received handshake_response via TCP.
+      // Keep endpoint_ and data_endpoint_ pointing at the UDP address —
+      // that's where all data traffic must go.
+      // Do NOT overwrite them with the TCP address of the server.
+    } else {
+      // TODO: Why is this needed, if we are able to get a response for the handshake init
+      // packet then we already know its endpoint?
+      peer->endpoint_protocol_ = packet->protocol;
+      peer->endpoint_ = packet->addr;
+      if (!keypair->enabled_features[WG_FEATURE_HYBRID_TCP] || !peer->IsTransientDataEndpointActive()) {
+        peer->data_endpoint_protocol_ = peer->endpoint_protocol_;
+        peer->data_endpoint_ = peer->endpoint_;
+      }
     }
   // If hybrid tcp mode was enabled for the connection, switch
   // the data endpoint to the udp endpoint.
