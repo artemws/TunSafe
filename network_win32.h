@@ -165,6 +165,13 @@ public:
   void WakeUp();
   void PostQueuedItem(QueuedItem *item);
   void CloseOutgoingTcpForAddr(const IpAddr &addr);
+
+private:
+  // Set by PacketProcessor thread to request TCP socket closure.
+  // Consumed by NetworkThread at the top of its loop.
+  IpAddr pending_close_addr_;
+  bool   pending_close_valid_;
+  CRITICAL_SECTION pending_close_lock_;
 private:
   void ThreadMain();
   static DWORD WINAPI NetworkThread(void *x);
