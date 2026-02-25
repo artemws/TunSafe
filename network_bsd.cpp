@@ -1384,9 +1384,33 @@ void TcpSocketBsd::Periodic() {
 
   // Deferred close: hybrid_tcp sockets are kept alive briefly after handshake
   // to mimic normal HTTPS session lifetime, then closed gracefully.
-  if (deferred_close_at_ != 0 && now_sec >= deferred_close_at_) {
-    CloseSocketAndDestroy();
-    return;
+  if (deferred_close_at_ != 0) {
+    if (now_sec >= deferred_close_at_) {
+      CloseSocketAndDestroy();
+      return;
+    }
+    // During the deferred window, send HTTP/2-like PING frames (~1/sec) to
+    // make the idle TCP session look like an active HTTPS/2 connection.
+    // HTTP/2 PING = 9-byte frame header + 8 bytes opaque data = 17 bytes,
+    // wrapped in a TLS Application Data record = 22 bytes total.
+    if (writable_ && tcp_packet_handler_.client_hello_parsed()) {
+      Packet *pkt = AllocPacket();
+      if (pkt) {
+        // Build the TLS Application Data record directly (marked prepared).
+        // Content: HTTP/2 PING frame with random opaque data.
+        static const uint payload_size = 17;
+        pkt->data[0] = 0x17; pkt->data[1] = 0x03; pkt->data[2] = 0x03;
+        pkt->data[3] = 0x00; pkt->data[4] = payload_size;
+        // HTTP/2 PING frame header: length=8, type=PING(6), flags=0, stream=0
+        pkt->data[5]  = 0x00; pkt->data[6]  = 0x00; pkt->data[7]  = 0x08;
+        pkt->data[8]  = 0x06; pkt->data[9]  = 0x00;
+        pkt->data[10] = 0x00; pkt->data[11] = 0x00; pkt->data[12] = 0x00; pkt->data[13] = 0x00;
+        OsGetRandomBytes(pkt->data + 14, 8);  // random opaque ping data
+        pkt->size = 5 + payload_size;
+        pkt->prepared = true;
+        WritePacket(pkt);
+      }
+    }
   }
 
   // Idle timeout for unauthenticated incoming connections:
@@ -1494,8 +1518,35 @@ void TcpSocketBsd::DoRead() {
 void TcpSocketBsd::DoWrite() {
   enum { kMaxIoWrite = 16 };
   struct iovec vecs[kMaxIoWrite];
-  Packet *p = wqueue_;
   size_t nvec = 0;
+
+  // Drain any fake TLS records (post-ServerHello handshake simulation)
+  // that must be sent before the first real data packet.
+  Packet *fake = tcp_packet_handler_.StealFakeOutPackets();
+  for (Packet *fp = fake; fp && nvec < kMaxIoWrite; fp = Packet_NEXT(fp)) {
+    vecs[nvec].iov_base = fp->data;
+    vecs[nvec].iov_len  = fp->size;
+    nvec++;
+  }
+  if (fake && nvec > 0) {
+    ssize_t n = writev(fd_, vecs, nvec);
+    // Free fake packets regardless of write result
+    while (fake) { Packet *nxt = Packet_NEXT(fake); FreePacket(fake); fake = nxt; }
+    if (n < 0) {
+      if (errno != EAGAIN) {
+        RERROR("tcp writev (fake records) error: %d", errno);
+        CloseSocketAndDestroy();
+        return;
+      }
+      writable_ = false;
+      SetPollFlags(POLLIN | POLLOUT);
+      return;
+    }
+    nvec = 0;
+  }
+
+  Packet *p = wqueue_;
+  nvec = 0;
   for (; p && nvec < kMaxIoWrite; p = Packet_NEXT(p)) {
     if (!p->prepared)
       tcp_packet_handler_.PrepareOutgoingPackets(p);
