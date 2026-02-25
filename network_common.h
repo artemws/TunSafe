@@ -154,6 +154,17 @@ public:
     sni_ = hostname ? hostname : "";
   }
 
+  // Steal pre-queued fake TLS records (EncryptedExtensions, Certificate etc.)
+  // Returns the head of a singly-linked Packet chain (via Packet_NEXT).
+  // The caller is responsible for writing these before any real data packets.
+  // Returns NULL if no fake records are pending.
+  Packet *StealFakeOutPackets() {
+    Packet *head = fake_out_head_;
+    fake_out_head_ = NULL;
+    fake_out_tail_ = &fake_out_head_;
+    return head;
+  }
+
   bool error() const { return error_flag_; }
   bool real_tls_detected() const { return real_tls_detected_; }
   bool plaintext_detected() const { return plaintext_detected_; }
@@ -181,10 +192,14 @@ private:
   bool real_tls_detected_;   // incoming real TLS ClientHello seen
   bool plaintext_detected_;  // incoming plaintext (HTTP etc.) seen
   bool replay_done_;         // stop mirroring to raw_replay_
+  bool is_server_;           // true for incoming (server-side) connections
   uint8 obfuscation_mode_;
   std::string sni_;          // SNI hostname for TLS ClientHello
   uint8 read_state_, write_state_, tls_read_state_;
   bool decryptor_initialized_;
+  // Server side: number of fake post-ServerHello records still to inject
+  // (EncryptedExtensions, Certificate, CertificateVerify, Finished)
+  uint8 fake_hs_records_left_;
 
   uint8 packet_header_[2];
 
@@ -198,6 +213,11 @@ private:
 
   // There's a separate queue for tls since it unwraps stuff
   TcpPacketQueue tls_queue_;
+
+  // Fake TLS records queued to be sent before the first real data packet.
+  // Populated on server side after ServerHello to mimic TLS 1.3 handshake.
+  Packet *fake_out_head_;
+  Packet **fake_out_tail_;
 
   uint32 predicted_key_in_, predicted_key_out_;
   uint64 predicted_serial_in_, predicted_serial_out_;
