@@ -281,6 +281,7 @@ public:
   TcpSocketBsd *next() { return next_; }
   uint8 endpoint_protocol() { return endpoint_protocol_; }
   const IpAddr &endpoint() { return endpoint_; }
+  void SetDeferredClose(uint32 at_sec) { deferred_close_at_ = at_sec; }
 
   virtual void Periodic() override;
 
@@ -301,6 +302,7 @@ private:
   uint8 handshake_attempts_;
   uint32 handshake_timestamp_;
   uint32 connect_timestamp_;
+  uint32 deferred_close_at_;   // if non-zero, close at this monotonic second
   uint8 proxy_timeout_;
   bool wg_packet_received_;  // true once a valid WireGuard packet came through
   
