@@ -313,33 +313,95 @@ jobs:
             exit 1
           }
 
-      - name: Patch network_win32_tcp.cpp (fix includes)
+
+      - name: Remove network_win32_tcp.cpp from vcxproj (avoid LNK2005 duplicates)
         shell: pwsh
         run: |
-          # network_win32_tcp.cpp должен включать network_win32.h (а не network_win32_tcp.h напрямую)
-          # чтобы видеть полное определение NetworkWin32.
-          # Также нужны tunsafe_endian.h (ReadLE32) и wireguard_proto.h (MESSAGE_HANDSHAKE_INITIATION).
-          $c = Get-Content network_win32_tcp.cpp -Raw
+          # Оригинальный network_win32.cpp уже содержит реализации TcpSocketWin32/TcpSocketQueue.
+          # Наш network_win32_tcp.cpp тоже содержит их → LNK2005 при линковке.
+          # Решение: убрать network_win32_tcp.cpp из списка компилируемых файлов.
+          # Используем XML-парсер для надёжности.
 
-          # Заменяем #include "network_win32_tcp.h" на правильный набор includes
-          if ($c -match '#include "network_win32_tcp\.h"') {
-            $c = $c -replace '#include "network_win32_tcp\.h"\r?\n', ''
-            Write-Host "Removed #include network_win32_tcp.h from network_win32_tcp.cpp"
+          $vcxPath = (Resolve-Path "TunSafe.vcxproj").Path
+          [xml]$vcx = Get-Content $vcxPath -Encoding UTF8
+          $removed = $false
+
+          foreach ($ig in $vcx.Project.ItemGroup) {
+            $items = @($ig.ClCompile)
+            foreach ($item in $items) {
+              if ($item -and $item.Include -eq "network_win32_tcp.cpp") {
+                $ig.RemoveChild($item) | Out-Null
+                $removed = $true
+              }
+            }
           }
 
-          # Добавляем нужные includes если их нет
-          if ($c -notmatch '#include "tunsafe_endian\.h"') {
-            $c = $c -replace '(#include "network_win32\.h")', "`$1`r`n#include `"tunsafe_endian.h`""
-            Write-Host "Added tunsafe_endian.h"
-          }
-          if ($c -notmatch '#include "wireguard_proto\.h"') {
-            $c = $c -replace '(#include "tunsafe_endian\.h")', "`$1`r`n#include `"wireguard_proto.h`""
-            Write-Host "Added wireguard_proto.h"
+          $vcx.Save($vcxPath)
+
+          if ($removed) {
+            Write-Host "OK: removed network_win32_tcp.cpp from vcxproj"
+          } else {
+            Write-Host "network_win32_tcp.cpp was not in vcxproj (already clean)"
           }
 
-          $c | Set-Content network_win32_tcp.cpp -Encoding UTF8 -NoNewline
-          Write-Host "network_win32_tcp.cpp first 12 lines:"
-          Get-Content network_win32_tcp.cpp | Select-Object -First 12
+          # Verify
+          $check = Select-String -Path $vcxPath -Pattern 'ClCompile.*network_win32_tcp\.cpp' -Quiet
+          if ($check) { Write-Host "ERROR: still present!"; exit 1 }
+          else { Write-Host "Verified: not in compilation list" }
+
+      - name: Patch network_win32.cpp (inject DPI evasion into original TcpSocket code)
+        shell: pwsh
+        run: |
+          # Применяем наши изменения к оригинальному network_win32.cpp.
+          # Все изменения идемпотентны (проверяем перед вставкой).
+
+          $c = Get-Content network_win32.cpp -Raw
+
+          # A) deferred_close_at_ = 0 в конструкторе TcpSocketWin32
+          if ($c -notmatch 'deferred_close_at_ = 0') {
+            $c = $c -replace '(handshake_timestamp_ = 0;)', "`$1`n  deferred_close_at_ = 0;"
+            Write-Host "A: added deferred_close_at_ init"
+          } else { Write-Host "A: already present" }
+
+          # B) StealFakeOutPackets() в DoMoreWrites — prepend fake TLS перед первым пакетом
+          if ($c -notmatch 'StealFakeOutPackets') {
+            $fake = "`n    // Prepend fake TLS records (post-ServerHello simulation)" +
+                    "`n    { Packet *_f = tcp_packet_handler_.StealFakeOutPackets();" +
+                    "`n      if (_f) { Packet *_t = _f; while (Packet_NEXT(_t)) _t = Packet_NEXT(_t);" +
+                    "`n        Packet_NEXT(_t) = wqueue_; if (!wqueue_) wqueue_end_ = &Packet_NEXT(_t); wqueue_ = _f; } }"
+            # (?s) = Singleline: '.' матчит \n тоже — нужно для многострочного тела функции
+            $c = $c -replace '(?s)(void TcpSocketWin32::DoMoreWrites\(\)\s*\{.*?if \(writes_active_ == 0\) \{)', "`$1$fake"
+            Write-Host "B: added StealFakeOutPackets"
+          } else { Write-Host "B: already present" }
+
+          # C) deferred_close_at_ check в DoIO — закрыть сокет по таймеру
+          if ($c -notmatch 'deferred_close_at_ != 0') {
+            $defer = "`n  if (deferred_close_at_ != 0) {" +
+                     "`n    if ((uint32)(OsGetMilliseconds()/1000) >= deferred_close_at_) CloseSocket();" +
+                     "`n  }"
+            $c = $c -replace '(void TcpSocketWin32::DoIO\(\)\s*\{)', "`$1$defer"
+            Write-Host "C: added deferred_close_at_ check"
+          } else { Write-Host "C: already present" }
+
+          # D) SetSni при создании исходящего TCP соединения в TcpSocketQueue
+          if ($c -notmatch '\.SetSni\(') {
+            $c = $c -replace '(tcp->WritePacket\(exch\(packet, Packet_NEXT\(packet\)\)\);)',
+              "if (!sni_.empty()) tcp->tcp_packet_handler_.SetSni(sni_.c_str());`n    `$1"
+            Write-Host "D: added SetSni call"
+          } else { Write-Host "D: already present" }
+
+          # E) Добавить tunsafe_endian.h если нет (для ReadLE32)
+          if ($c -notmatch '#include "tunsafe_endian') {
+            $c = $c -replace '(#include "wireguard_proto\.h")', "#include `"tunsafe_endian.h`"`n`$1"
+            Write-Host "E: added tunsafe_endian.h"
+          } else { Write-Host "E: already present" }
+
+          $c | Set-Content network_win32.cpp -Encoding UTF8 -NoNewline
+          Write-Host "Done patching network_win32.cpp"
+          Write-Host "--- Key patch markers ---"
+          Select-String network_win32.cpp -Pattern 'deferred_close_at_|StealFakeOutPackets|SetSni' |
+            Select-Object LineNumber, Line | Select-Object -First 8
+
 
       - name: Build x64
         run: |
