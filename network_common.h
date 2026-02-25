@@ -3,6 +3,7 @@
 
 #include "netapi.h"
 #include "crypto/chacha20poly1305.h"
+#include <string>
 
 class PacketProcessor;
 class WgPacketObfuscator;
@@ -147,6 +148,12 @@ public:
   // Attempt to extract the next packet, returns NULL when complete.
   Packet *GetNextWireguardPacket();
   
+  // Set the SNI hostname to use in the TLS ClientHello.
+  // Must be called before the first outgoing packet is prepared.
+  void SetSni(const char *hostname) {
+    sni_ = hostname ? hostname : "";
+  }
+
   bool error() const { return error_flag_; }
   bool real_tls_detected() const { return real_tls_detected_; }
   bool plaintext_detected() const { return plaintext_detected_; }
@@ -175,6 +182,7 @@ private:
   bool plaintext_detected_;  // incoming plaintext (HTTP etc.) seen
   bool replay_done_;         // stop mirroring to raw_replay_
   uint8 obfuscation_mode_;
+  std::string sni_;          // SNI hostname for TLS ClientHello
   uint8 read_state_, write_state_, tls_read_state_;
   bool decryptor_initialized_;
 
