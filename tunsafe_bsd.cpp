@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-1.0-only
 // Copyright (C) 2018 Ludvig Strigeus <info@tunsafe.com>. All Rights Reserved.
 #include "tunsafe_bsd.h"
+#include "network_bsd.h"
 #include "tunsafe_endian.h"
 #include "tunsafe_wg_plugin.h"
 #include "util.h"
@@ -404,7 +405,7 @@ static bool IsIpv6AddressSet(const void *p) {
 }
  
 // Called to initialize tun
-bool TunsafeBackendBsd::Configure(const TunConfig &&config, TunConfigOut *out) override {
+bool TunsafeBackendBsd::Configure(const TunConfig &&config, TunConfigOut *out) {
   char buf[kSizeOfAddress];
   char buf2[kSizeOfAddress];
 
@@ -827,6 +828,21 @@ void TunsafeBackendBsdImpl::OnRequestToken(WgPeer *peer, uint32 type) {
   }
 }
 
+
+// Forward declaration for wireguard_proto.cpp static function
+static WgAddrEntry::IpPort ConvertIpAddrToAddrX(const IpAddr &src) {
+  WgAddrEntry::IpPort r;
+  if (src.sin.sin_family == AF_INET) {
+    Write64(r.bytes, src.sin.sin_addr.s_addr);
+    Write64(r.bytes + 8, 0);
+    Write32(r.bytes + 16, src.sin.sin_port);
+  } else {
+    memcpy(r.bytes, &src.sin6.sin6_addr, 16);
+    Write32(r.bytes + 16, (AF_INET6 << 16) + src.sin6.sin6_port);
+  }
+  return r;
+}
+
 void TunsafeBackendBsdImpl::CloseOrphanTcpConnections() {
   // Add all incoming tcp connections into a lookup table
   WG_HASHTABLE_IMPL<WgAddrEntry::IpPort, void*, WgAddrEntry::IpPortHasher> lookup;
@@ -870,6 +886,7 @@ int main(int argc, char **argv) {
 #if defined(OS_MACOSX)
   InitOsxGetMilliseconds();
 #endif
+
 
   SetThreadName("tunsafe-m");
 
