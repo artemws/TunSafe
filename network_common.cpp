@@ -125,9 +125,9 @@ uint TcpPacketQueue::PeekUint16() {
 TcpPacketHandler::TcpPacketHandler(SimplePacketPool *packet_pool, WgPacketObfuscator *obfuscator, bool is_incoming)
    : queue_(packet_pool),
      raw_replay_(packet_pool),
-     tls_queue_(packet_pool),
-     write_state_(is_incoming),
      is_server_(is_incoming),
+     write_state_(is_incoming),
+     tls_queue_(packet_pool),
      obfuscation_mode_(kObfuscationMode_None) {
 
   if (obfuscator->enabled() && obfuscator->obfuscate_tcp() != TcpPacketHandler::kObfuscationMode_None) {
