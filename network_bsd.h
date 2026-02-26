@@ -47,6 +47,8 @@ public:
   bool *sigalarm_flag() { return &sigalarm_flag_; }
 
   TcpSocketBsd *tcp_sockets() { return tcp_sockets_; }
+  void ResetConnectingLog() { tcp_connecting_logged_ = false; }
+  bool tcp_connecting_logged_;
   bool overload() { return overload_; }
 private:
   void RemoveFromRoundRobin(int slot);
