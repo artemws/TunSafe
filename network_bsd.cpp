@@ -917,9 +917,6 @@ void TcpSocketListenerBsd::HandleEvents(int revents) {
       return;
     }
 
-    char buf[kSizeOfAddress];
-    RINFO("Created new tcp socket from %s", PrintIpAddr(addr, buf));
-
     TcpSocketBsd *channel = new TcpSocketBsd(network_, processor_, true);
     if (channel)
       channel->InitializeIncoming(new_fd, addr);
@@ -1018,9 +1015,6 @@ TcpSocketBsd::~TcpSocketBsd() {
   while (*p != this) p = &(*p)->next_;
   *p = next_;
 
-  char buf[kSizeOfAddress];
-  const char *peer_str = endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, buf) : "(unknown)";
-  RINFO("Destroyed tcp socket from %s", peer_str);
 }
 
 void TcpSocketBsd::InitializeIncoming(int fd, const IpAddr &addr) {
@@ -1387,7 +1381,9 @@ bool TcpSocketBsd::LaunchProxy() {
   tcp_packet_handler_.StealReplayBuffer(&buf_head, &buf_tail, &buf_bytes);
 
   int cfd = StealFd();
-  RINFO("TcpProxy: forwarding to %s:%u (%u buffered bytes)",
+  char src_buf[kSizeOfAddress];
+  RINFO("TcpProxy: forwarding %s -> %s:%u (%u buffered bytes)",
+        endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, src_buf) : "(unknown)",
         dom.c_str(), (unsigned)processor_->proxy_port(), buf_bytes);
 
   new TcpProxySocketBsd(network_, cfd, rfd, buf_head, buf_tail, buf_bytes);
