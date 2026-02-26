@@ -829,7 +829,9 @@ void TunsafeBackendBsdImpl::OnRequestToken(WgPeer *peer, uint32 type) {
 }
 
 
-// Forward declaration for wireguard_proto.cpp static function
+// ConvertIpAddrToAddrX is static in wireguard_proto.cpp; provide a local copy
+// only when not building via tunsafe_amalgam.cpp (which includes both .cpp files).
+#ifndef TUNSAFE_AMALGAM_INCLUDE
 static WgAddrEntry::IpPort ConvertIpAddrToAddrX(const IpAddr &src) {
   WgAddrEntry::IpPort r;
   if (src.sin.sin_family == AF_INET) {
@@ -842,6 +844,7 @@ static WgAddrEntry::IpPort ConvertIpAddrToAddrX(const IpAddr &src) {
   }
   return r;
 }
+#endif // TUNSAFE_AMALGAM_INCLUDE
 
 void TunsafeBackendBsdImpl::CloseOrphanTcpConnections() {
   // Add all incoming tcp connections into a lookup table
