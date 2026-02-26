@@ -1,5 +1,7 @@
 #include "build_config.h"
 
+// Signal that tunsafe_bsd.cpp is being included via amalgam (avoids duplicate definitions)
+#define TUNSAFE_AMALGAM_INCLUDE 1
 // Skip asm for IOS simulator
 #if defined(OS_IOS) && defined(ARCH_CPU_X86_FAMILY)
 #define CHACHA20_WITH_ASM 0
