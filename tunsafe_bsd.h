@@ -57,4 +57,8 @@ protected:
   bool tun_interface_gone_;
 };
 
+#include "tunsafe_ipaddr.h"
+
+const char *print_ip(char buf[kSizeOfAddress], uint32 ip);
+
 #endif  // TUNSAFE_NETWORK_BSD_COMMON_H_
