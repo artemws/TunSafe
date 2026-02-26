@@ -95,9 +95,6 @@ void TcpSocketWin32::DoConnect() {
     return;
   }
 
-  char buf[kSizeOfAddress];
-  RINFO("Connecting to tcp://%s...", PrintIpAddr(endpoint_, buf));
-
   state_ = STATE_CONNECTING;
   ClearOverlapped(&connect_overlapped_.overlapped);
   connect_overlapped_.queue_cb = this;
@@ -313,7 +310,7 @@ void TcpSocketWin32::OnQueuedItemDelete(QueuedItem *qi) {
 
 /////////////////////////////////////////////////////////////////////////
 
-TcpSocketQueue::TcpSocketQueue(NetworkWin32 *network, WgPacketObfuscator *obfuscator) {
+TcpSocketQueue::TcpSocketQueue(NetworkWin32 *network, WgPacketObfuscator *obfuscator) : connecting_logged_(false) {
   network_ = network;
   wqueue_ = NULL;
   wqueue_end_ = &wqueue_;
@@ -361,6 +358,11 @@ AGAIN:
     }
 
     // Initialize a new tcp socket and connect to the endpoint
+    if (!connecting_logged_) {
+      connecting_logged_ = true;
+      char _clog_buf[kSizeOfAddress];
+      RINFO("Connecting to tcp://%s...", PrintIpAddr(packet->addr, _clog_buf));
+    }
     TcpSocketWin32 *tcp = new TcpSocketWin32(network_, packet_handler_, obfuscator_, false);
     tcp->state_ = TcpSocketWin32::STATE_WANT_CONNECT;
     tcp->endpoint_ = packet->addr;
