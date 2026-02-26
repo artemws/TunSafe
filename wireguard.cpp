@@ -635,12 +635,18 @@ void WireguardProcessor::SendHandshakeInitiation(WgPeer *peer) {
     if (procdel_)
       procdel_->OnConnectionRetry(peer, attempts);
     peer->OnHandshakeInitSent();
-    // If a separate TCP endpoint is configured (EndpointTCP), send the
-    // handshake via TCP regardless of the UDP endpoint protocol.
-    if (peer->tcp_endpoint().sin.sin_family != 0) {
+    // Handshake endpoint selection:
+    //  - Endpoint only            → UDP handshake + UDP data
+    //  - EndpointTCP only         → TCP handshake + TCP data
+    //  - Endpoint + EndpointTCP   → UDP (EndpointTCP ignored unless hybrid_tcp)
+    //  - Endpoint + EndpointTCP + hybrid_tcp → TCP handshake, UDP data
+    if (peer->tcp_endpoint().sin.sin_family != 0 &&
+        (peer->endpoint_.sin.sin_family == 0 || peer->wants_hybrid_tcp())) {
+      // Use TCP endpoint for handshake: either EndpointTCP-only or hybrid_tcp mode
       packet->addr     = peer->tcp_endpoint();
       packet->protocol = kPacketProtocolTcp;
     } else {
+      // Use Endpoint for handshake (UDP, or pure TCP via tcp:// prefix)
       packet->addr     = peer->endpoint_;
       packet->protocol = peer->endpoint_protocol_;
     }
