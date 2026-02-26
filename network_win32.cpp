@@ -1987,8 +1987,10 @@ void TunsafeRunner::OnConnectionRetry(WgPeer *peer, uint32 attempts) {
   TunsafeBackendWin32 *backend = backend_;
   if (backend->status() == TunsafeBackend::kStatusInitializing)
     backend->SetStatus(TunsafeBackend::kStatusConnecting);
-  else if (attempts >= 3 && backend->status() == TunsafeBackend::kStatusConnected)
+  else if (attempts >= 3 && backend->status() == TunsafeBackend::kStatusConnected) {
     backend->SetStatus(TunsafeBackend::kStatusReconnecting);
+    tcp_socket_queue_.ResetConnectingLog();  // Allow "Connecting to tcp://..." to print again
+  }
 }
 
 
