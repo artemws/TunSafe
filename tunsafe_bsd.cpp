@@ -821,6 +821,7 @@ void TunsafeBackendBsdImpl::OnConnectionRetry(WgPeer *peer, uint32 attempts) {
         peer_str = PrintIpAddr(ep, buf);
     }
     RINFO("Peer %s disconnected, reconnecting...", peer_str);
+    network_.ResetConnectingLog();  // Allow "Connecting to tcp://..." to print again
   }
 }
 
