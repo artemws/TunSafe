@@ -1202,8 +1202,6 @@ void WgPeer::OnHandshakeFullyComplete() {
             curr_keypair_->enabled_features[WG_FEATURE_ID_SKIP_KEYID_OUT] ? ", skip_keyid_out" : "",
             curr_keypair_->enabled_features[WG_FEATURE_HYBRID_TCP] ? ", hybrid_tcp" : "");
     }
-  } else {
-    RINFO("Handshake complete for peer %s", peer_str);
   }
   last_complete_handskake_timestamp_ = now;
 }
