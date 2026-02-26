@@ -1953,8 +1953,6 @@ void TunsafeRunner::WriteUdpPacket(Packet *packet) {
 }
 
 void TunsafeRunner::CloseOutgoingTcpForAddr(const IpAddr &addr) {
-  char buf[kSizeOfAddress];
-  RINFO("hybrid_tcp: closing TCP socket to %s after handshake complete", PrintIpAddr(addr, buf));
   net_.CloseOutgoingTcpForAddr(addr);
 }
 
