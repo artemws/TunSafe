@@ -453,6 +453,7 @@ bool TunsafeBackendBsd::Configure(const TunConfig &&config, TunConfigOut *out) {
 #endif
 
 
+#if !defined(OS_ANDROID)
   char default_iface[16];
   uint32 ipv4_default_gw;
   bool found_ipv4_route = GetDefaultRoute(default_iface, sizeof(default_iface), &ipv4_default_gw);
@@ -468,6 +469,7 @@ bool TunsafeBackendBsd::Configure(const TunConfig &&config, TunConfigOut *out) {
       return false;
     }
   }
+#endif  // !defined(OS_ANDROID)
 
   // Add all the extra routes
   for (auto it = config.included_routes.begin(); it != config.included_routes.end(); ++it) {
@@ -712,6 +714,12 @@ TunsafeBackendBsdImpl::~TunsafeBackendBsdImpl() {
 }
 
 bool TunsafeBackendBsdImpl::InitializeTun(char devname[16]) {
+#if defined(OS_ANDROID)
+  // On Android, the TUN fd is provided by Java via VpnService.
+  // tunsafe_android.cpp overrides InitializeTun, so this path is never called.
+  RERROR("InitializeTun should not be called on Android");
+  return false;
+#else
   int tun_fd = open_tun(devname, 16);
   if (tun_fd < 0) { RERROR("Error opening tun device"); return false; }
   if (!tun_.Initialize(tun_fd)) {
@@ -719,7 +727,8 @@ bool TunsafeBackendBsdImpl::InitializeTun(char devname[16]) {
     return false;
   }
   unix_socket_listener_.Initialize(devname);
-  return true;  
+  return true;
+#endif  // !defined(OS_ANDROID)
 }
 
 void TunsafeBackendBsdImpl::WriteTunPacket(Packet *packet) {
@@ -872,6 +881,7 @@ void TunsafeBackendBsdImpl::CloseOrphanTcpConnections() {
   for(const auto &it : lookup)
     delete (TcpSocketBsd *)it.second;
 }
+#ifndef OS_ANDROID
 int main(int argc, char **argv) {
   CommandLineOutput cmd = {0};
 
@@ -916,3 +926,4 @@ int main(int argc, char **argv) {
 
   return 0;
 }
+#endif  // !defined(OS_ANDROID)
