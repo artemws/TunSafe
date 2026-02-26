@@ -525,6 +525,7 @@ public:
   // If set, TCP handshakes go here; UDP data goes to endpoint_.
   void SetTcpEndpoint(const IpAddr &sin);
   const IpAddr &tcp_endpoint() const { return tcp_endpoint_; }
+  bool wants_hybrid_tcp() const { return features_[WG_FEATURE_HYBRID_TCP] >= WG_BOOLEAN_FEATURE_WANTS; }
   void SetAllowMulticast(bool allow);
 
   void SetFeature(int feature, uint8 value);
