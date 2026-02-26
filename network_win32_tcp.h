@@ -103,6 +103,7 @@ public:
   virtual void OnQueuedItemDelete(QueuedItem *ow) override;
 
   void WritePacket(Packet *packet);
+  void ResetConnectingLog() { connecting_logged_ = false; }
 
 private:
   void TransmitPackets(Packet *packet);
@@ -121,4 +122,7 @@ private:
 
   // Used for queueing things on the network instance
   QueuedItem queued_item_;
+
+  // Suppress repeated "Connecting to tcp://..." messages
+  bool connecting_logged_;
 };
