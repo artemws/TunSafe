@@ -14,7 +14,7 @@ class BaseSocketBsd;
 class TcpSocketBsd;
 class TcpProxySocketBsd;
 class WireguardProcessor;
-class Packet;
+struct Packet;
 
 class NetworkBsd {
   friend class BaseSocketBsd;
