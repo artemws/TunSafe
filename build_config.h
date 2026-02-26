@@ -12,7 +12,7 @@
 #if defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
 #define OS_IOS 1
 #endif  // defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE
-#elif defined(ANDROID)
+#elif defined(ANDROID) || defined(__ANDROID__)
 #define OS_ANDROID 1
 #elif defined(__native_client__)
 #define OS_NACL 1
