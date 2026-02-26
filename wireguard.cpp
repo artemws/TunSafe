@@ -621,8 +621,9 @@ void WireguardProcessor::ForceSendHandshakeInitiation(WgPeer *peer) {
 void WireguardProcessor::SendHandshakeInitiation(WgPeer *peer) {
   assert(dev_.IsMainThread());
 
+  // Require at least one endpoint (UDP or TCP-only).
   if (!peer->CheckHandshakeRateLimit() ||
-      peer->endpoint_.sin.sin_family == 0 ||
+      (peer->endpoint_.sin.sin_family == 0 && peer->tcp_endpoint().sin.sin_family == 0) ||
       (dev_.plugin_ && !dev_.plugin_->WantHandshake(peer)))
     return;
   Packet *packet = AllocPacket();
