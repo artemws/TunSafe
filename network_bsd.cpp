@@ -108,6 +108,7 @@ NetworkBsd::NetworkBsd(NetworkBsdDelegate *delegate, int max_sockets)
       tcp_sockets_(NULL),
       delegate_(delegate),
       max_sockets_(max_sockets) {
+  tcp_connecting_logged_ = false;
   if (max_sockets < 5 || max_sockets > 1000)
     tunsafe_die("invalid value for max_sockets");
 
@@ -970,6 +971,12 @@ void TcpSocketBsd::WriteTcpPacket(NetworkBsd *network, WireguardProcessor *proce
     }
   }
   // Initialize a new tcp socket and connect to the endpoint
+  if (!network->tcp_connecting_logged_) {
+    network->tcp_connecting_logged_ = true;
+    char _clog_buf[kSizeOfAddress];
+    RINFO("Connecting to tcp://%s:%d...", PrintIpAddr(connect_addr, _clog_buf),
+          ReadBE16(&connect_addr.sin.sin_port));
+  }
   TcpSocketBsd *tcp = new TcpSocketBsd(network, processor, false);
   if (!tcp || !tcp->InitializeOutgoing(connect_addr)) {
     delete tcp;
@@ -1044,9 +1051,6 @@ bool TcpSocketBsd::InitializeOutgoing(const IpAddr &addr) {
   extern bool android_protect_socket_extern(int fd);
   android_protect_socket_extern(fd);
 #endif
-
-  char buf[kSizeOfAddress];
-  RINFO("Connecting to tcp://%s:%d...", PrintIpAddr(endpoint_, buf), ReadBE16(&endpoint_.sin.sin_port));
 
   if (connect(fd, (sockaddr*)&endpoint_.sin,
               endpoint_.sin.sin_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6))) {
