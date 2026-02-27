@@ -23,6 +23,7 @@ set(CORE_SOURCES
     ${ROOT}/crypto/aesgcm/aesgcm.cpp
     ${ROOT}/crypto/sha/sha1.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/network_android.cpp
+    ${ROOT}/wireguard_config_ext.cpp
 )
 
 add_library(tunsafe SHARED ${CORE_SOURCES})
