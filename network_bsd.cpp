@@ -1,13 +1,11 @@
 // SPDX-License-Identifier: AGPL-1.0-only
 // Copyright (C) 2018 Ludvig Strigeus <info@tunsafe.com>. All Rights Reserved.
+#include "tunsafe_bsd.h"
 #include "network_bsd.h"
-
-// Forward declarations for transparent proxy implementation
-class TcpProxySocketBsd;
-class TcpProxyRemoteBsd;
-#include "network_common.h"
 #include "tunsafe_endian.h"
+#include "tunsafe_wg_plugin.h"
 #include "util.h"
+#include "wireguard_config_ext.h"
 
 #include <stdio.h>
 #include <unistd.h>
@@ -17,1655 +15,917 @@ class TcpProxyRemoteBsd;
 #include <netinet/in.h>
 #include <string.h>
 #include <arpa/inet.h>
-#include <netdb.h>
 #include <sys/stat.h>
-#include <sys/un.h>
-#include <sys/uio.h>
 #include <stdlib.h>
 #include <errno.h>
 #include <assert.h>
 #include <signal.h>
-#include <poll.h>
 
-#if defined(OS_LINUX)
+#include <sys/socket.h>
+#include <net/route.h>
+#include <sys/time.h>
+
+#include <pthread.h>
+
+#if defined(OS_MACOSX)
+#include <sys/kern_control.h>
+#include <net/if_utun.h>
+#include <sys/sys_domain.h>
+#include <mach/mach.h>
+#include <mach/mach_time.h>
+#include <net/if_dl.h>
+#elif defined(OS_FREEBSD)
+#include <net/if_tun.h>
+#include <net/if_dl.h>
+#elif defined(OS_LINUX)
+#include <linux/if.h>
+#include <linux/if_tun.h>
+#include <sys/prctl.h>
+#include <linux/rtnetlink.h>
 #include <sys/inotify.h>
 #include <limits.h>
-#include <sys/prctl.h>
 #endif
 
-#if defined(OS_ANDROID)
-#include <android/log.h>
-#endif
-
-#include <algorithm>
-
-#include "wireguard.h"
-#include "wireguard_config.h"
+static bool g_daemon_mode;
 
 #if defined(OS_MACOSX) || defined(OS_FREEBSD)
-#define TUN_PREFIX_BYTES 4
-#elif defined(OS_LINUX) || defined(OS_ANDROID)
-#define TUN_PREFIX_BYTES 0
-#endif
+struct MyRouteMsg {
+  struct rt_msghdr hdr;
+  uint32 pad;
+  struct sockaddr_in target;
+  struct sockaddr_in netmask;
+};
 
-static Packet *freelist;
+struct MyRouteReply {
+  struct rt_msghdr hdr;
+  uint8 buf[512];
+};
 
-void tunsafe_die(const char *msg) {
-#if defined(OS_ANDROID)
-  __android_log_print(6 /*ANDROID_LOG_ERROR*/, "TunSafe", "FATAL: %s", msg);
-  abort();
+// Zero gets rounded up
+#if defined(OS_MACOSX)
+#define RTMSG_ROUNDUP(a) ((a) ? ((((a) - 1) | (sizeof(uint32_t) - 1)) + 1) : sizeof(uint32_t))
 #else
-  fprintf(stderr, "%s\n", msg);
-  exit(1);
-#endif
-}
-
-void SetThreadName(const char *name) {
-#if defined(OS_LINUX)
-  prctl(PR_SET_NAME, name, 0, 0, 0);
-#endif  // defined(OS_LINUX)
-}
-
-void FreePacket(Packet *packet) {
-  packet->queue_next = freelist;
-  freelist = packet;
-}
-
-Packet *AllocPacket() {
-  Packet *p = freelist;
-  if (p) {
-    freelist = Packet_NEXT(p);
-  } else {
-    p = (Packet*)malloc(kPacketAllocSize);  
-    if (p == NULL) {
-      RERROR("Allocation failure");
-      abort();
-    }
-  }
-  p->Reset();
-  return p;
-}
-
-void FreePacketList(Packet *packet) {
-  while (packet)
-    free(exch(packet, Packet_NEXT(packet)));
-}
-
-void FreeAllPackets() {
-  FreePacketList(exch_null(freelist));
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-NetworkBsd::NetworkBsd(NetworkBsdDelegate *delegate, int max_sockets)
-    : exit_(false),
-      overload_(false),
-      sigalarm_flag_(false),
-      num_roundrobin_(0),
-      num_sock_(0),
-      num_endloop_(0),
-      read_packet_(NULL),
-      tcp_sockets_(NULL),
-      delegate_(delegate),
-      max_sockets_(max_sockets) {
-  tcp_connecting_logged_ = false;
-  if (max_sockets < 5 || max_sockets > 1000)
-    tunsafe_die("invalid value for max_sockets");
-
-  pollfd_ = new struct pollfd[max_sockets];
-  sockets_ = new BaseSocketBsd*[max_sockets];
-  roundrobin_ = new BaseSocketBsd*[max_sockets];
-  endloop_ = new BaseSocketBsd*[max_sockets];
-  if (!pollfd_ || !sockets_ || !roundrobin_ || !endloop_)
-    tunsafe_die("no memory");
-
-  memset(iov_packets_, 0, sizeof(iov_packets_));
-}
-
-NetworkBsd::~NetworkBsd() {
-  assert(tcp_sockets_ == NULL);
-  assert(num_sock_ == 0);
-  if (read_packet_)
-    FreePacket(read_packet_);
-  for (size_t i = 0; i < kMaxIovec; i++)
-    if (iov_packets_[i])
-      FreePacket(iov_packets_[i]);
-
-  delete [] pollfd_;
-  delete [] sockets_;
-  delete [] roundrobin_;
-  delete [] endloop_;
-}
-
-void NetworkBsd::RunLoop(const sigset_t *sigmask) {
-  int free_packet_interval = 10;
-  int overload_ctr = 0;
-  uint64 last_second_loop = 0;
-  uint64 now = 0;
-
-  if (!WithSigalarmSupport)
-    last_second_loop = OsGetMilliseconds();
-  
-  while (!exit_) {
-    int n;
-    bool new_second = false;
-
-    if (WithSigalarmSupport) {
-      if (sigalarm_flag_) {
-        sigalarm_flag_ = false;
-        new_second = true;
-      }
-    } else {
-      now = OsGetMilliseconds();
-      if ((now - last_second_loop) >= 1000) {
-        // Avoid falling behind too much
-        last_second_loop = (now - last_second_loop) >= 2000 ? now : last_second_loop + 1000;
-        new_second = true;
-      }
-    }
-
-    if (new_second) {
-      delegate_->OnSecondLoop(now);
-      
-      struct BaseSocketBsd **socks = sockets_;
-      for (int i = 0; i < num_sock_; i++)
-        socks[i]->Periodic();
-
-      if (free_packet_interval == 0) {
-        FreeAllPackets();
-        free_packet_interval = 10;
-      }
-      free_packet_interval--;
-
-      overload_ctr -= (overload_ctr != 0);
-    }
-
-#if defined(OS_LINUX) || defined(OS_FREEBSD)
-    n = ppoll(pollfd_, num_sock_, NULL, sigmask);
-#else
-    n = poll(pollfd_, num_sock_, WithSigalarmSupport ? -1 : std::max<int>((int)(last_second_loop - now) + 1000, 0));
-#endif
-    if (n == -1) {
-      if (errno != EINTR) {
-        RERROR("poll failed");
-        break;
-      }
-    } else {
-      // Iterate backwards to support deleting elements
-      struct pollfd *pfd = pollfd_;
-      struct BaseSocketBsd **socks = sockets_;
-      for (int i = num_sock_ - 1; i >= 0; i--) {
-        if (pfd[i].revents)
-          socks[i]->HandleEvents(pfd[i].revents);
-      }
-    }
-
-    overload_ = (overload_ctr != 0);
-    for (int loop = 0; ; loop++) {
-      // Whenever we don't finish set overload ctr.
-      if (loop == 256) {
-        overload_ctr = 4;
-        break;
-      }
-      int i = num_roundrobin_ - 1;
-      struct BaseSocketBsd **rrlist = roundrobin_;
-      if (i < 0)
-        break;
-      do {
-        if (!rrlist[i]->DoRoundRobin())
-          RemoveFromRoundRobin(i);
-      } while (i--);
-    }
-
-    struct BaseSocketBsd **endloop = endloop_;
-    for (int j = num_endloop_ - 1; j >= 0; j--) {
-      endloop[j]->endloop_slot_ = -1;
-      endloop[j]->DoEndloop();
-    }
-    num_endloop_ = 0;
-
-    delegate_->RunAllMainThreadScheduled();
-  }
-}
-
-void NetworkBsd::RemoveFromRoundRobin(int i) {
-  BaseSocketBsd *cur = roundrobin_[i], *last = roundrobin_[num_roundrobin_-- - 1];
-  assert(cur->roundrobin_slot_ == i);
-  roundrobin_[i] = last;
-  last->roundrobin_slot_ = i;
-  cur->roundrobin_slot_ = -1;
-}
-
-void NetworkBsd::ReallocateIov(size_t j) {
-  Packet *p = AllocPacket();
-  iov_packets_[j] = p;
-  iov_[j].iov_base = p->data;
-  iov_[j].iov_len = kPacketCapacity;
-}
-
-void NetworkBsd::EnsureIovAllocated() {
-  if (iov_packets_[0] == NULL) {
-    for (size_t i = 0; i < kMaxIovec; i++)
-      ReallocateIov(i);
-  }
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-BaseSocketBsd::~BaseSocketBsd() {
-  CloseSocket();
-}
-
-void BaseSocketBsd::CloseSocket() {
-  if (fd_ != -1)
-    close(fd_);
-  if (roundrobin_slot_ >= 0)
-    network_->RemoveFromRoundRobin(roundrobin_slot_);
-  if (endloop_slot_ >= 0) {
-    BaseSocketBsd *last = network_->endloop_[network_->num_endloop_-- - 1];
-    network_->endloop_[endloop_slot_] = last;
-    last->endloop_slot_ = endloop_slot_;
-  }
-  if (pollfd_slot_ >= 0) {
-    unsigned int cur = pollfd_slot_, last = network_->num_sock_-- - 1;
-    BaseSocketBsd *lastsock = network_->sockets_[last];
-    network_->sockets_[cur] = lastsock;
-    lastsock->pollfd_slot_ = cur;
-    network_->pollfd_[cur] = network_->pollfd_[last];
-  }
-  fd_ = -1;
-  endloop_slot_ = pollfd_slot_ = roundrobin_slot_ = -1;
-}
-
-void BaseSocketBsd::InitPollSlot(int fd, int events) {
-  assert(network_->num_sock_ != network_->max_sockets_);
-  assert(fd_ == -1);
-  fd_ = fd;
-  unsigned int slot = pollfd_slot_;
-  if (pollfd_slot_ < 0)
-    pollfd_slot_ = slot = network_->num_sock_++;
-  network_->sockets_[slot] = this;
-  struct pollfd *pfd = &network_->pollfd_[slot];
-  pfd->fd = fd;
-  pfd->events = events;
-  pfd->revents = 0;
-}
-
-void BaseSocketBsd::AddToRoundRobin() {
-  if (roundrobin_slot_ < 0)
-    network_->roundrobin_[roundrobin_slot_ = network_->num_roundrobin_++] = this;
-}
-
-void BaseSocketBsd::AddToEndLoop() {
-  if (endloop_slot_ < 0)
-    network_->endloop_[endloop_slot_ = network_->num_endloop_++] = this;
-}
-
-int BaseSocketBsd::StealFd() {
-  int fd = exch(fd_, -1);
-  CloseSocket();
-  return fd;
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-TunSocketBsd::TunSocketBsd(NetworkBsd *network, WireguardProcessor *processor)
-    : BaseSocketBsd(network),
-      tun_readable_(false),
-      tun_writable_(false),
-      tun_interface_gone_(false),
-      tun_queue_(NULL),
-      tun_queue_end_(&tun_queue_),
-      processor_(processor) {
-}
-
-TunSocketBsd::~TunSocketBsd() {
-}
-
-bool TunSocketBsd::Initialize(int fd) {
-  if (!HasFreePollSlot())
-    return false;
-  fcntl(fd, F_SETFD, FD_CLOEXEC);
-  fcntl(fd, F_SETFL, O_NONBLOCK);
-  InitPollSlot(fd, POLLIN);
-  tun_writable_ = true;
-  return true;
-}
-
-static inline bool IsCompatibleProto(uint32 v) {
-  return v == AF_INET || v == AF_INET6;
-}
-
-void TunSocketBsd::HandleEvents(int revents) {
-  if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-    if (revents & POLLERR) {
-      tun_interface_gone_ = true;
-      RERROR("Tun interface gone, closing.");
-    } else {
-      RERROR("Tun interface error %d, closing.", revents);
-    }
-    tun_readable_ = tun_writable_ = false;
-    network_->PostExit();
-  } else {
-    tun_readable_ = (revents & POLLIN) != 0;
-    if (revents & POLLOUT) {
-      SetPollFlags(POLLIN);
-      tun_writable_ = true;
-    }
-  }
-  AddToRoundRobin();
-}
-
-bool TunSocketBsd::DoRead() {
-  assert(tun_readable_);
-  Packet *packet = network_->read_packet_;
-  if (!packet)
-    network_->read_packet_ = packet = AllocPacket();
-
-  int r = read(fd_, packet->data - TUN_PREFIX_BYTES, kPacketCapacity + TUN_PREFIX_BYTES);
-  if (r >= 0) {
-//        printf("Read %d bytes from TUN\n", r);
-    packet->size = r - TUN_PREFIX_BYTES;
-    if (r >= TUN_PREFIX_BYTES && (!TUN_PREFIX_BYTES || IsCompatibleProto(ReadBE32(packet->data - TUN_PREFIX_BYTES)))) {
-      //      printf("%X %X %X %X %X %X %X %X\n",
-      //        read_packet_->data[0], read_packet_->data[1], read_packet_->data[2], read_packet_->data[3], 
-      //        read_packet_->data[4], read_packet_->data[5], read_packet_->data[6], read_packet_->data[7]);
-      network_->read_packet_ = NULL;
-      processor_->HandleTunPacket(packet);
-    }
-    return true;
-  } else {
-    if (errno != EAGAIN) {
-      fprintf(stderr, "Read from tun failed\n");
-    }
-    tun_readable_ = false;
-    return false;
-  }
-}
-
-static uint32 GetProtoFromPacket(const uint8 *data, size_t size) {
-  return size < 1 || (data[0] >> 4) != 6 ? AF_INET : AF_INET6;
-}
-
-bool TunSocketBsd::DoWrite() {
-  assert(tun_writable_);
-  if (TUN_PREFIX_BYTES) {
-    WriteBE32(tun_queue_->data - TUN_PREFIX_BYTES, GetProtoFromPacket(tun_queue_->data, tun_queue_->size));
-  }
-  int r = write(fd_, tun_queue_->data - TUN_PREFIX_BYTES, tun_queue_->size + TUN_PREFIX_BYTES);
-  if (r < 0) {
-    if (errno == EAGAIN) {
-      tun_writable_ = false;
-      SetPollFlags(POLLIN | POLLOUT);
-      return false;
-    }
-    RERROR("Write to tun failed");
-  } else {
-    r -= TUN_PREFIX_BYTES;
-    if (r != tun_queue_->size)
-      RERROR("Write to tun incomplete!");
-    //    else
-    //      RINFO("Wrote %d bytes to TUN", r);
-  }
-  Packet *next = Packet_NEXT(tun_queue_);
-  FreePacket(tun_queue_);
-  if ((tun_queue_ = next) != NULL) return true;
-  tun_queue_end_ = &tun_queue_;
-  return false;
-}
-
-void TunSocketBsd::WritePacket(Packet *packet) {
-  assert(fd_ >= 0);
-  Packet *queue_is_used = tun_queue_;
-  *tun_queue_end_ = packet;
-  tun_queue_end_ = &Packet_NEXT(packet);
-  packet->queue_next = NULL;
-  if (!queue_is_used)
-    DoWrite();
-}
-
-bool TunSocketBsd::DoRoundRobin() {
-  bool more_work = false;
-  if (tun_queue_ && tun_writable_)
-    more_work = DoWrite();
-  if (tun_readable_)
-    more_work |= DoRead();
-  return more_work;
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-UdpSocketBsd::UdpSocketBsd(NetworkBsd *network, WireguardProcessor *processor)
-    : BaseSocketBsd(network),
-      udp_readable_(false),
-      udp_writable_(false),
-      udp_queue_(NULL),
-      udp_queue_end_(&udp_queue_),
-      processor_(processor) {
-}
-
-UdpSocketBsd::~UdpSocketBsd() {
-}
-
-bool UdpSocketBsd::Initialize(int listen_port) {
-  if (!HasFreePollSlot()) {
-    RERROR("No free internal sockets");
-    return false;
-  }
-  int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (udp_fd < 0) {
-    RERROR("socket(SOCK_DGRAM) failed");  
-    return false;
-  }
-  sockaddr_in sin = {0};
-  sin.sin_family = AF_INET;
-  sin.sin_port = htons(listen_port);
-  if (bind(udp_fd, (struct sockaddr*)&sin, sizeof(sin)) != 0) {
-    close(udp_fd);
-    RERROR("bind on udp socket port %d failed", listen_port);
-    return false;
-  }
-  fcntl(udp_fd, F_SETFD, FD_CLOEXEC);
-  fcntl(udp_fd, F_SETFL, O_NONBLOCK);
-  InitPollSlot(udp_fd, POLLIN);
-  udp_writable_ = true;
-  return true;
-}
-
-void UdpSocketBsd::HandleEvents(int revents) {
-  if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-    RERROR("UDP error %d, closing.", revents);
-    network_->PostExit();
-  } else {
-    udp_readable_ = (revents & POLLIN) != 0;
-    if (revents & POLLOUT) {
-      SetPollFlags(POLLIN);
-      udp_writable_ = true;
-    }
-  }
-  AddToRoundRobin();
-}
-
-bool UdpSocketBsd::DoRead() {
-  socklen_t sin_len;
-  Packet *read_packet = network_->read_packet_;
-  if (read_packet == NULL)
-    network_->read_packet_ = read_packet = AllocPacket();
-
-  sin_len = sizeof(read_packet->addr.sin);
-  int r = recvfrom(fd_, read_packet->data, kPacketCapacity, 0,
-                   (sockaddr*)&read_packet->addr.sin, &sin_len);
-  if (r >= 0) {
-    //    printf("Read %d bytes from UDP\n", r);
-    read_packet->sin_size = sin_len;
-    read_packet->size = r;
-    read_packet->protocol = kPacketProtocolUdp;
-    network_->read_packet_ = NULL;
-
-    if (processor_->dev().packet_obfuscator().enabled())
-      processor_->dev().packet_obfuscator().DeobfuscatePacket(read_packet);
-    processor_->HandleUdpPacket(read_packet, network_->overload_);
-    return true;
-  } else {
-    if (errno != EAGAIN) {
-      fprintf(stderr, "Read from UDP failed\n");
-    }
-    udp_readable_ = false;
-    return false;
-  }
-}
-
-bool UdpSocketBsd::DoWrite() {
-  assert(udp_writable_);
-  //  RINFO("Send %d bytes to %s", (int)udp_queue_->size, inet_ntoa(udp_queue_->sin.sin_addr));
-  int r = sendto(fd_, udp_queue_->data, udp_queue_->size, 0,
-                 (sockaddr*)&udp_queue_->addr.sin, sizeof(udp_queue_->addr.sin));
-  if (r < 0) {
-    if (errno == EAGAIN) {
-      udp_writable_ = false;
-      SetPollFlags(POLLIN | POLLOUT);
-      return false;
-    }
-    perror("Write to UDP failed");
-  } else {
-    if (r != udp_queue_->size)
-      perror("Write to udp incomplete!");
-    //    else
-    //      RINFO("Wrote %d bytes to UDP", r);
-  }
-  Packet *next = Packet_NEXT(udp_queue_);
-  FreePacket(udp_queue_);
-  if ((udp_queue_ = next) != NULL) return true;
-  udp_queue_end_ = &udp_queue_;
-  return false;
-}
-
-void UdpSocketBsd::WritePacket(Packet *packet) {
-  assert(fd_ >= 0);
-
-  if (processor_->dev().packet_obfuscator().enabled())
-    processor_->dev().packet_obfuscator().ObfuscatePacket(packet);
-   
-  Packet *queue_is_used = udp_queue_;
-  *udp_queue_end_ = packet;
-  udp_queue_end_ = &Packet_NEXT(packet);
-  packet->queue_next = NULL;
-  if (!queue_is_used)
-    DoWrite();
-}
-
-bool UdpSocketBsd::DoRoundRobin() {
-  bool did_work = false;
-  if (udp_queue_ && udp_writable_)
-    did_work = DoWrite();
-  if (udp_readable_)
-    did_work |= DoRead();
-  return did_work;
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-#if defined(OS_LINUX)
-UnixSocketDeletionWatcher::UnixSocketDeletionWatcher() 
-    : inotify_fd_(-1) {
-  pipes_[0] = -1;
-  pipes_[0] = -1;
-}
-
-UnixSocketDeletionWatcher::~UnixSocketDeletionWatcher() {
-  close(inotify_fd_);
-  close(pipes_[0]);
-  close(pipes_[1]);
-}
-
-bool UnixSocketDeletionWatcher::Start(const char *path, bool *flag_to_set) {
-  assert(inotify_fd_ == -1);
-  path_ = path;
-  flag_to_set_ = flag_to_set;
-  pid_ = getpid();
-  inotify_fd_ = inotify_init1(IN_CLOEXEC | IN_NONBLOCK);
-  if (inotify_fd_ == -1) {
-    perror("inotify_init1() failed");
-    return false;
-  }
-  if (inotify_add_watch(inotify_fd_, "/var/run/wireguard", IN_DELETE | IN_DELETE_SELF) == -1) {
-    perror("inotify_add_watch failed");
-    return false;
-  }
-  if (pipe(pipes_) == -1) {
-    perror("pipe() failed");
-    return false;
-  }
-  return pthread_create(&thread_, NULL, &UnixSocketDeletionWatcher::RunThread, this) == 0;
-}
-
-void UnixSocketDeletionWatcher::Stop() {
-  RINFO("Stopping..");
-  void *retval;
-  write(pipes_[1], "", 1);
-  pthread_join(thread_, &retval);
-}
-
-void *UnixSocketDeletionWatcher::RunThread(void *arg) {
-  UnixSocketDeletionWatcher *self = (UnixSocketDeletionWatcher*)arg;
-  return self->RunThreadInner();
-}
-
-void *UnixSocketDeletionWatcher::RunThreadInner() {
-  char buf[sizeof(struct inotify_event) + NAME_MAX + 1]
-     __attribute__ ((aligned(__alignof__(struct inotify_event))));
-  fd_set fdset;
-  struct stat st;
-  for(;;) {
-    if (lstat(path_, &st) == -1 && errno == ENOENT) {
-      RINFO("Unix socket %s deleted.", path_);
-      *flag_to_set_ = true;
-      kill(pid_, SIGALRM);
-      break;
-    }
-    FD_ZERO(&fdset);
-    FD_SET(inotify_fd_, &fdset);
-    FD_SET(pipes_[0], &fdset);
-    int n = select(std::max(inotify_fd_, pipes_[0]) + 1, &fdset, NULL, NULL, NULL);
-    if (n == -1) {
-      if (errno == EINTR)
-        continue;
-      perror("select");
-      break;
-    }
-    if (FD_ISSET(inotify_fd_, &fdset)) {
-      ssize_t len = read(inotify_fd_, buf, sizeof(buf));
-      if (len == -1) {
-        perror("read");
-        break;
-      }
-    }
-    if (FD_ISSET(pipes_[0], &fdset))
-      break;
-  }
-  return NULL;
-}
-
-#else  // !defined(OS_LINUX)
-
-bool UnixSocketDeletionWatcher::Poll(const char *path) {
-  struct stat st;
-  return lstat(path, &st) == -1 && errno == ENOENT;
-}
-
-#endif // !defined(OS_LINUX)
-
-UnixDomainSocketListenerBsd::UnixDomainSocketListenerBsd(NetworkBsd *network, WireguardProcessor *processor)
-    : BaseSocketBsd(network),
-      processor_(processor) {
-  memset(&un_addr_, 0, sizeof(un_addr_));
-}
-
-UnixDomainSocketListenerBsd::~UnixDomainSocketListenerBsd() {
-  if (un_addr_.sun_path[0])
-    unlink(un_addr_.sun_path);
-}
-
-bool UnixDomainSocketListenerBsd::Initialize(const char *devname) {
-  if (!HasFreePollSlot())
-    return false;
-  int fd = socket(AF_UNIX, SOCK_STREAM, 0);
-  if (fd == -1) {
-    RERROR("Error creating unix domain socket");
-    return false;
-  }
-
-  fcntl(fd, F_SETFD, FD_CLOEXEC);
-  fcntl(fd, F_SETFL, O_NONBLOCK);
-
-  mkdir("/var/run/wireguard", 0755);
-  un_addr_.sun_family = AF_UNIX;
-  snprintf(un_addr_.sun_path, sizeof(un_addr_.sun_path), "/var/run/wireguard/%s.sock", devname);
-  unlink(un_addr_.sun_path);
-  if (bind(fd, (struct sockaddr*)&un_addr_, sizeof(un_addr_)) == -1) {
-    RERROR("Error binding unix domain socket");
-    close(fd);
-    return false;
-  }
-  if (listen(fd, 5) == -1) {
-    RERROR("Error listening on unix domain socket");
-    close(fd);
-    return false;
-  }
-  InitPollSlot(fd, POLLIN);
-  return true;
-}
-
-void UnixDomainSocketListenerBsd::HandleEvents(int revents) {
-  if (revents & POLLIN) {
-    // wait if we can't allocate more pollfd
-    if (!HasFreePollSlot()) {
-      SetPollFlags(0);
-      return;
-    }
-    int new_fd = accept(fd_, NULL, NULL);
-    if (new_fd >= 0) {
-      UnixDomainSocketChannelBsd *channel = new UnixDomainSocketChannelBsd(network_, processor_, new_fd);
-    } else {
-      RERROR("Unix domain socket accept failed");
-    }
-  }
-  if (revents & ~POLLIN) {
-    RERROR("Unix domain socket got an error code");
-  }
-}
-
-void UnixDomainSocketListenerBsd::Periodic() {
-  if (un_deletion_watcher_.Poll(un_addr_.sun_path)) {
-    RINFO("Unix socket %s deleted.", un_addr_.sun_path);
-    network_->PostExit();
-  } else {
-    // try again
-    SetPollFlags(POLLIN);
-  }
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-UnixDomainSocketChannelBsd::UnixDomainSocketChannelBsd(NetworkBsd *network, WireguardProcessor *processor, int fd) 
-    : BaseSocketBsd(network),
-      processor_(processor) {
-  assert(HasFreePollSlot());
-  InitPollSlot(fd, POLLIN);
-}
-
-UnixDomainSocketChannelBsd::~UnixDomainSocketChannelBsd() {
-}
-
-static const char *FindMessageEnd(const char *start, size_t size) {
-  if (size <= 1)
-    return NULL;
-  const char *start_end = start + size - 1;
-  for (; (start = (const char*)memchr(start, '\n', start_end - start)) != NULL; start++) {
-    if (start[1] == '\n')
-      return start + 2;
-  }
-  return NULL;
-}
-
-bool UnixDomainSocketChannelBsd::HandleEventsInner(int revents) {
-  if (revents & POLLIN) {
-    char buf[4096];
-    // read as much data as we can until we see \n\n
-    ssize_t n = recv(fd_, buf, sizeof(buf), 0);
-    if (n <= 0)
-      return (n == -1 && errno == EAGAIN);  // premature eof or error
-    inbuf_.append(buf, n);
-    const char *message_end = FindMessageEnd(&inbuf_[0], inbuf_.size());
-    if (message_end) {
-      if (message_end != &inbuf_[inbuf_.size()])
-        return false;  // trailing data?
-      WgConfig::HandleConfigurationProtocolMessage(processor_, std::move(inbuf_), &outbuf_);
-      if (!outbuf_.size())
-        return false;
-      SetPollFlags(POLLOUT);
-      revents |= POLLOUT;
-    }
-  }
-  if (revents & POLLOUT) {
-    size_t n = send(fd_, outbuf_.data(), outbuf_.size(), 0);
-    if (n <= 0)
-      return (n == -1 && errno == EAGAIN);  // premature eof or error
-    outbuf_.erase(0, n);
-    if (!outbuf_.size())
-      return false;
-  }
-  if (revents & ~(POLLIN | POLLOUT)) {
-    RERROR("Unix domain socket got an error code");
-    return false;
-  }
-  return true;
-}
-
-void UnixDomainSocketChannelBsd::HandleEvents(int revents) {
-  if (!HandleEventsInner(revents))
-    delete this;
-}
-
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-TcpSocketListenerBsd::TcpSocketListenerBsd(NetworkBsd *bsd, WireguardProcessor *processor)
-    : BaseSocketBsd(bsd),
-      processor_(processor) {
-
-}
-
-TcpSocketListenerBsd::~TcpSocketListenerBsd() {
-
-}
-
-bool TcpSocketListenerBsd::Initialize(int port) {
-  if (!HasFreePollSlot())
-    return false;
-
-  CloseSocket();
-
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) { RERROR("Error listen socket"); return false; }
-  fcntl(fd, F_SETFD, FD_CLOEXEC);
-  fcntl(fd, F_SETFL, O_NONBLOCK);
-
-  int optval = 1;
- // setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
-  setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
-
-  sockaddr_in sin = {0};
-  sin.sin_family = AF_INET;
-  sin.sin_port = htons(port);
-  sin.sin_addr.s_addr = INADDR_ANY;
-  if (bind(fd, (sockaddr*)&sin, sizeof(sin))) {
-    RERROR("Error binding socket on port %d", port);
-    close(fd);
-    return false;
-  }
-  if (listen(fd, 5)) {
-    RERROR("Error listen socket");
-    close(fd);
-    return false;
-  }
-  RINFO("Started TCP listening socket on port %d", port);
-  InitPollSlot(fd, POLLIN);
-  return true;
-}
-
-int TcpSocketListenerBsd::CountIncomingTcpSockets() const {
-  int count = 0;
-  for (TcpSocketBsd *tcp = network_->tcp_sockets(); tcp; tcp = tcp->next())
-    if (tcp->endpoint_protocol() & kPacketProtocolIncomingConnection)
-      count++;
-  return count;
-}
-
-bool TcpSocketListenerBsd::CheckRateLimit(const IpAddr &addr, uint32 now_sec) {
-  // Extract a 32-bit key from the address (IPv4 directly, IPv6 last 32 bits)
-  uint32 ip = (addr.sin.sin_family == AF_INET)
-      ? ReadBE32(&addr.sin.sin_addr)
-      : ReadBE32((uint8*)&addr.sin6.sin6_addr + 12);
-
-  // Search existing entry
-  for (int i = 0; i < rate_count_; i++) {
-    RateEntry &e = rate_table_[rate_lru_[i]];
-    if (e.ip != ip) continue;
-
-    // Move to front of LRU
-    int idx = rate_lru_[i];
-    memmove(&rate_lru_[1], &rate_lru_[0], i * sizeof(int));
-    rate_lru_[0] = idx;
-
-    // Reset window if expired
-    if (now_sec - e.window_sec >= (uint32)kRateWindowSec) {
-      e.window_sec = now_sec;
-      e.count = 0;
-    }
-
-    if (++e.count > (uint32)kRateMaxConns) {
-      if (e.count == (uint32)kRateMaxConns + 1) {
-        char buf[kSizeOfAddress];
-        RERROR("TCP rate limit exceeded for %s — dropping connection", PrintIpAddr(addr, buf));
-      }
-      return false;
-    }
-    return true;
-  }
-
-  // New entry — evict LRU if table full
-  int slot;
-  if (rate_count_ < kMaxRateEntries) {
-    slot = rate_count_++;
-    rate_lru_[rate_count_ - 1] = slot;  // will be moved to front below
-  } else {
-    slot = rate_lru_[kMaxRateEntries - 1];
-  }
-  memmove(&rate_lru_[1], &rate_lru_[0], (rate_count_ - 1) * sizeof(int));
-  rate_lru_[0] = slot;
-  rate_table_[slot] = { ip, 1, now_sec };
-  return true;
-}
-
-void TcpSocketListenerBsd::HandleEvents(int revents) {
-  if (revents & POLLIN) {
-    // wait if we can't allocate more pollfd
-    if (!HasFreePollSlot()) {
-      SetPollFlags(0);
-      return;
-    }
-
-    IpAddr addr;
-    socklen_t len = sizeof(addr);
-    int new_fd = accept(fd_, (sockaddr*)&addr, &len);
-    if (new_fd < 0) {
-      RERROR("Unix domain socket accept failed");
-      return;
-    }
-
-    // Limit total simultaneous incoming TCP connections
-    if (CountIncomingTcpSockets() >= kMaxTotalIncoming) {
-      char buf[kSizeOfAddress];
-      RERROR("TCP connection limit reached, dropping %s", PrintIpAddr(addr, buf));
-      close(new_fd);
-      return;
-    }
-
-    // Per-IP rate limiting
-    uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
-    if (!CheckRateLimit(addr, now_sec)) {
-      close(new_fd);
-      return;
-    }
-
-    TcpSocketBsd *channel = new TcpSocketBsd(network_, processor_, true);
-    if (channel)
-      channel->InitializeIncoming(new_fd, addr);
-    else
-      close(new_fd);
-  }
-}
-
-void TcpSocketListenerBsd::Periodic() {
-  SetPollFlags(POLLIN);
-}
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-void TcpSocketBsd::WriteTcpPacket(NetworkBsd *network, WireguardProcessor *processor, Packet *packet) {
-  bool is_handshake = ReadLE32(packet->data) == MESSAGE_HANDSHAKE_INITIATION;
-
-  // Check if we have a tcp connection for the endpoint, otherwise create one.
-  for (TcpSocketBsd *tcp = network->tcp_sockets(); tcp; tcp = tcp->next()) {
-    // After we send 3 handshakes on a tcp socket in a row, then close and reopen the socket because it seems defunct.
-    if (CompareIpAddr(&tcp->endpoint(), &packet->addr) == 0 && tcp->endpoint_protocol() == packet->protocol) {
-      if (is_handshake) {
-        uint32 now = (uint32)OsGetMilliseconds();
-        uint32 secs = (now - tcp->handshake_timestamp_) >> 10;
-        tcp->handshake_timestamp_ += secs * 1024;
-        int calc = (secs > (uint32)tcp->handshake_attempts_ + 25) ? 0 : tcp->handshake_attempts_ + 25 - secs;
-        tcp->handshake_attempts_ = calc;
-        if (calc >= 60) {
-          RINFO("Making new Tcp socket due to too many handshake failures");
-          delete tcp;
-          break;
-        }
-      }
-      tcp->WritePacket(packet);
-      return;
-    }
-  }
-  // Drop tcp packet that's for an incoming connection, or packets that are
-  // not a handshake.
-  if ((packet->protocol & kPacketProtocolIncomingConnection) || !is_handshake) {
-    FreePacket(packet);
-    return;
-  }
-  // If the peer has a separate EndpointTCP configured, connect there instead
-  // of using the UDP endpoint address.
-  IpAddr connect_addr = packet->addr;
-  for (WgPeer *peer = processor->dev().first_peer(); peer; peer = peer->next_peer()) {
-    if (CompareIpAddr(&peer->endpoint(), &packet->addr) == 0 &&
-        peer->tcp_endpoint().sin.sin_family != 0) {
-      connect_addr = peer->tcp_endpoint();
-      break;
-    }
-  }
-  // Initialize a new tcp socket and connect to the endpoint
-  if (!network->tcp_connecting_logged_) {
-    network->tcp_connecting_logged_ = true;
-    char _clog_buf[kSizeOfAddress];
-    RINFO("Connecting to tcp://%s:%d...", PrintIpAddr(connect_addr, _clog_buf),
-          ReadBE16(&connect_addr.sin.sin_port));
-  }
-  TcpSocketBsd *tcp = new TcpSocketBsd(network, processor, false);
-  if (!tcp || !tcp->InitializeOutgoing(connect_addr)) {
-    delete tcp;
-    FreePacket(packet);
-    return;
-  }
-  // Use TcpProxyTarget domain as SNI so the ClientHello matches the target server.
-  if (!processor->proxy_domain().empty())
-    tcp->tcp_packet_handler_.SetSni(processor->proxy_domain().c_str());
-  tcp->WritePacket(packet);
-}
-
-
-//////////////////////////////////////////////////////////////////////////////////////////////
-
-TcpSocketBsd::TcpSocketBsd(NetworkBsd *net, WireguardProcessor *processor, bool is_incoming) 
-    : BaseSocketBsd(net),
-      readable_(false),
-      writable_(true),
-      endpoint_protocol_(0),
-      age(0),
-      handshake_attempts_(0),
-      handshake_timestamp_(0),
-      connect_timestamp_((uint32)(OsGetMilliseconds() / 1000)),
-      deferred_close_at_(0),
-      proxy_timeout_(0),
-      wg_packet_received_(false),
-      wqueue_(NULL),
-      wqueue_end_(&wqueue_),
-      wqueue_packets_(0),
-      processor_(processor),
-      tcp_packet_handler_(&net->packet_pool_, &processor->dev().packet_obfuscator(), is_incoming) {
-  // insert in network's linked list
-  next_ = net->tcp_sockets_;
-  net->tcp_sockets_ = this;
-
-  network_->EnsureIovAllocated();
-}
-
-TcpSocketBsd::~TcpSocketBsd() {
-  // Unlink myself from the network's linked list.
-  TcpSocketBsd **p = &network_->tcp_sockets_;
-  while (*p != this) p = &(*p)->next_;
-  *p = next_;
-
-}
-
-void TcpSocketBsd::InitializeIncoming(int fd, const IpAddr &addr) {
-  assert(fd_ == -1);
-  endpoint_protocol_ = kPacketProtocolTcp | kPacketProtocolIncomingConnection;
-  endpoint_ = addr;
-  InitPollSlot(fd, POLLIN);
-}
-
-bool TcpSocketBsd::InitializeOutgoing(const IpAddr &addr) {
-  assert(fd_ == -1);
-  if (!HasFreePollSlot() || addr.sin.sin_family == 0)
-    return false;
-
-  endpoint_protocol_ = kPacketProtocolTcp;
-  endpoint_ = addr;
-  writable_ = false;
-
-  int fd = socket(addr.sin.sin_family, SOCK_STREAM, 0);
-  if (fd < 0) { perror("socket: outgoing tcp"); return false; }
-  fcntl(fd, F_SETFD, FD_CLOEXEC);
-  fcntl(fd, F_SETFL, O_NONBLOCK);
-
-#if defined(OS_ANDROID)
-  // On Android the TCP socket must be protected from the VPN tunnel before
-  // connect() is called, otherwise the SYN packet loops back into the tun.
-  extern bool android_protect_socket_extern(int fd);
-  android_protect_socket_extern(fd);
+#define RTMSG_ROUNDUP(a) ((a) ? ((((a) - 1) | (sizeof(long) - 1)) + 1) : sizeof(long))
 #endif
 
-  if (connect(fd, (sockaddr*)&endpoint_.sin,
-              endpoint_.sin.sin_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6))) {
-    if (errno != EINPROGRESS) {
-      perror("connect: outgoing tcp");
+
+static bool GetDefaultRoute(char *iface, size_t iface_size, uint32 *gw_addr) {
+  int fd, pid, len;
+
+  union {
+    MyRouteMsg rt;
+    MyRouteReply rep;
+  };
+
+  fd = socket(PF_ROUTE, SOCK_RAW, AF_INET);
+  if (fd < 0)
+    return false;
+
+  memset(&rt, 0, sizeof(rt));
+
+  rt.hdr.rtm_type = RTM_GET;
+  rt.hdr.rtm_flags = RTF_UP | RTF_GATEWAY;
+  rt.hdr.rtm_version = RTM_VERSION;
+  rt.hdr.rtm_seq = 0;
+  rt.hdr.rtm_addrs = RTA_DST | RTA_NETMASK | RTA_IFP;
+
+  rt.target.sin_family = AF_INET;
+  rt.netmask.sin_family = AF_INET;
+
+  rt.target.sin_len = sizeof(struct sockaddr_in);
+  rt.netmask.sin_len = sizeof(struct sockaddr_in);
+
+  rt.hdr.rtm_msglen = sizeof(rt);
+
+  if (write(fd, (char*)&rt, sizeof(rt)) != sizeof(rt)) {
+    RERROR("PF_ROUTE write failed.");
+    close(fd);
+    return false;
+  }
+
+  pid = getpid();
+  do {
+    len = read(fd, (char *)&rep, sizeof(rep));
+    if (len <= 0) {
+      RERROR("PF_ROUTE read failed.");
       close(fd);
       return false;
     }
-  }
+  } while (rep.hdr.rtm_seq != 0 || rep.hdr.rtm_pid != pid);
+  close(fd);
 
-  InitPollSlot(fd, POLLOUT | POLLIN);
-  return true;
-}
+  const struct sockaddr_dl *ifp = NULL;
+  const struct sockaddr_in *gw = NULL;
 
-void TcpSocketBsd::WritePacket(Packet *packet) {
-  assert(fd_ >= 0);
+  uint8 *pos = rep.buf;
+  for (int i = 1; i && i < rep.hdr.rtm_addrs; i <<= 1) {
+    if (rep.hdr.rtm_addrs & i) {
+      if (1 > rep.buf + 512 - pos)
+        break; // invalid
+      size_t len = RTMSG_ROUNDUP(((struct sockaddr*)pos)->sa_len);
+      if (len > rep.buf + 512 - pos)
+        break; // invalid
+               //      RINFO("rtm %d %d", i, ((struct sockaddr*)pos)->sa_len);
+      if (i == RTA_IFP && ((struct sockaddr*)pos)->sa_len >= sizeof(struct sockaddr_dl)) {
+        ifp = (struct sockaddr_dl *)pos;
+      } else if (i == RTA_GATEWAY && ((struct sockaddr*)pos)->sa_len >= sizeof(struct sockaddr_in)) {
+        gw = (struct sockaddr_in *)pos;
 
-
-  Packet *old_value = wqueue_;
-  *wqueue_end_ = packet;
-  wqueue_end_ = &Packet_NEXT(packet);
-  packet->queue_next = NULL;
-  packet->prepared = false;
-
-  AddToEndLoop();
-
-  // Note: Cannot use bytes here, because the TCP packet
-  // headers have not been added yet, and then the
-  // accounting doesn't work
-  wqueue_packets_++;
-
-  // When enough packets have been queued up, perform the write.
-  if (writable_ && wqueue_packets_ >= 16)
-    DoWrite();
-}
-
-void TcpSocketBsd::HandleEvents(int revents) {
-  if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-    RINFO("TcpSocket error");
-    CloseSocketAndDestroy();
-    return;
-  }
-
-  if (revents & POLLOUT) {
-    SetPollFlags(POLLIN);
-    AddToEndLoop();
-    writable_ = true;
-  }
-
-  if (revents & POLLIN)
-    DoRead();
-}
-
-void TcpSocketBsd::DoEndloop() {
-  if (writable_ && wqueue_)
-    DoWrite();
-}
-
-// Launch a transparent TCP proxy to TcpProxyTarget.
-// Steals fd_ and all buffered bytes, creates TcpProxySocketBsd, then deletes *this.
-// Returns true if proxy was launched (caller must NOT touch *this after this call).
-// ============================================================================
-// TcpProxySocketBsd / TcpProxyRemoteBsd
-//
-// Two cooperating BaseSocketBsd objects that together implement a transparent
-// byte-level TCP proxy.
-//
-//  TcpProxySocketBsd  — holds the *client* fd (inherited via BaseSocketBsd)
-//  TcpProxyRemoteBsd  — holds the *remote* (upstream) fd
-//
-// Using two separate objects means each fd gets its own poll slot managed
-// correctly by BaseSocketBsd::CloseSocket() — no hand-rolled slot arithmetic
-// that was previously causing use-after-free crashes.
-// ============================================================================
-
-// Simple byte queue on top of the Packet chain
-struct ByteQueue {
-  Packet *head = nullptr;
-  Packet *tail_pkt = nullptr;   // last packet (for O(1) append of full packets)
-  uint32  bytes = 0;
-
-  void Append(Packet *p) {
-    p->queue_next = nullptr;
-    if (tail_pkt) Packet_NEXT(tail_pkt) = p;
-    else          head = p;
-    tail_pkt = p;
-    bytes += p->size;
-  }
-
-  void Free() {
-    while (head) { Packet *n = Packet_NEXT(head); FreePacket(head); head = n; }
-    tail_pkt = nullptr; bytes = 0;
-  }
-
-  // Write as much as possible to fd; returns false on fatal error.
-  bool Flush(int fd) {
-    while (head) {
-      ssize_t n = write(fd, head->data, head->size);
-      if (n < 0) return (errno == EAGAIN);
-      bytes -= n;
-      if ((size_t)n < (size_t)head->size) { head->data += n; head->size -= n; return true; }
-      Packet *nx = Packet_NEXT(head); FreePacket(head); head = nx;
-      if (!head) tail_pkt = nullptr;
+      }
+      pos += len;
     }
-    return true;
   }
+
+  if (ifp && ifp->sdl_nlen && ifp->sdl_nlen < iface_size) {
+    iface[ifp->sdl_nlen] = 0;
+    memcpy(iface, ifp->sdl_data, ifp->sdl_nlen);
+    if (gw && gw->sin_family == AF_INET) {
+      *gw_addr = ReadBE32(&gw->sin_addr);
+      return true;
+    }
+
+  }
+  //  RINFO("Read %d %d %d", len, rep.hdr.rtm_addrs, (int)sizeof(struct rt_msghdr ));
+  return false;
+}
+#endif  // defined(OS_MACOSX) || defined(OS_FREEBSD)
+
+#if defined(OS_LINUX)
+struct LinuxParsedRoute {
+  int has;
+  struct in_addr dst, gateway;
+  char ifname[IF_NAMESIZE];
 };
 
-class TcpProxyRemoteBsd : public BaseSocketBsd {
-public:
-  TcpProxyRemoteBsd(NetworkBsd *net, int fd, TcpProxySocketBsd *owner)
-      : BaseSocketBsd(net), owner_(owner), connected_(false) {
-    InitPollSlot(fd, POLLOUT);  // wait for connect()
-  }
-  virtual ~TcpProxyRemoteBsd() {}
-  virtual void HandleEvents(int revents) override;
-
-  bool connected() const { return connected_; }
-  ByteQueue &to_remote() { return to_remote_; }
-
-  void WantWrite(bool w) {
-    SetPollFlags(POLLIN | (w ? POLLOUT : 0));
-  }
-
-  TcpProxySocketBsd *owner_;  // public for cross-class nulling in Shutdown()
-private:
-  bool connected_;
-  ByteQueue to_remote_;
-};
-
-class TcpProxySocketBsd : public BaseSocketBsd {
-public:
-  TcpProxySocketBsd(NetworkBsd *net, int client_fd, int remote_fd,
-                    Packet *buf_head, Packet **buf_tail, uint32 buf_bytes);
-  virtual ~TcpProxySocketBsd();
-  virtual void HandleEvents(int revents) override;
-
-  // Called by TcpProxyRemoteBsd when it has data to send to client
-  void OnRemoteData(Packet *p);
-  // Called when remote side closes or errors
-  void OnRemoteGone();
-
-  ByteQueue &to_client() { return to_client_; }
-  void WantWrite(bool w) { SetPollFlags(POLLIN | (w ? POLLOUT : 0)); }
-
-private:
-  void Shutdown();
-  TcpProxyRemoteBsd *remote_;
-  ByteQueue to_client_;
-  bool shutting_down_;
-};
-
-// ---- TcpProxySocketBsd ----
-
-TcpProxySocketBsd::TcpProxySocketBsd(NetworkBsd *net, int client_fd, int remote_fd,
-                                     Packet *buf_head, Packet **buf_tail, uint32 buf_bytes)
-    : BaseSocketBsd(net), remote_(nullptr), shutting_down_(false) {
-  InitPollSlot(client_fd, POLLIN);
-
-  remote_ = new TcpProxyRemoteBsd(net, remote_fd, this);
-
-  // Pre-load replay buffer into remote's send queue
-  if (buf_head) {
-    Packet *p = buf_head;
-    while (p) {
-      Packet *nx = Packet_NEXT(p);
-      p->queue_next = nullptr;
-      remote_->to_remote().Append(p);
-      p = nx;
-    }
-  }
-}
-
-TcpProxySocketBsd::~TcpProxySocketBsd() {
-  to_client_.Free();
-  // remote_ deletes itself via Shutdown path; if we're being destroyed first, kill it.
-  if (remote_) {
-    remote_->owner_ = nullptr;
-    delete remote_;
-    remote_ = nullptr;
-  }
-}
-
-void TcpProxySocketBsd::Shutdown() {
-  if (shutting_down_) return;
-  shutting_down_ = true;
-  // Kill remote side first
-  if (remote_) {
-    remote_->owner_ = nullptr;
-    delete remote_;
-    remote_ = nullptr;
-  }
-  delete this;
-}
-
-void TcpProxySocketBsd::OnRemoteGone() {
-  remote_ = nullptr;
-  // Flush remaining data to client then close
-  if (to_client_.bytes == 0) {
-    Shutdown();
-  } else {
-    // Let HandleEvents drain to_client_, then Shutdown when empty
-  }
-}
-
-void TcpProxySocketBsd::OnRemoteData(Packet *p) {
-  to_client_.Append(p);
-  WantWrite(true);
-}
-
-void TcpProxySocketBsd::HandleEvents(int revents) {
-  if (revents & POLLIN) {
-    // Read from client, forward to remote
-    if (remote_ && remote_->connected()) {
-      Packet *p = AllocPacket();
-      if (p) {
-        ssize_t n = read(fd_, p->data, kPacketCapacity);
-        if (n > 0) {
-          p->size = (int)n;
-          remote_->to_remote().Append(p);
-          remote_->WantWrite(true);
-        } else {
-          FreePacket(p);
-          if (n == 0 || errno != EAGAIN) { Shutdown(); return; }
-        }
-      }
-    }
-  }
-  if (revents & POLLOUT) {
-    if (!to_client_.Flush(fd_)) { Shutdown(); return; }
-    if (to_client_.bytes == 0) {
-      WantWrite(false);
-      if (!remote_) { Shutdown(); return; }  // remote gone, all data drained
-    }
-  }
-  if (revents & (POLLERR | POLLHUP)) { Shutdown(); return; }
-}
-
-// ---- TcpProxyRemoteBsd ----
-
-void TcpProxyRemoteBsd::HandleEvents(int revents) {
-  if (!connected_) {
-    // Check connect() result
-    if (revents & (POLLOUT | POLLERR | POLLHUP)) {
-      int err = 0; socklen_t len = sizeof(err);
-      getsockopt(fd_, SOL_SOCKET, SO_ERROR, &err, &len);
-      if (err != 0) {
-        RERROR("TcpProxy: upstream connect failed: %s", strerror(err));
-        if (owner_) owner_->OnRemoteGone();
-        owner_ = nullptr;
-        delete this;
-        return;
-      }
-      connected_ = true;
-      RINFO("TcpProxy: connected to upstream, replaying %u bytes", to_remote_.bytes);
-      SetPollFlags(POLLIN | (to_remote_.bytes ? POLLOUT : 0));
-    }
-    return;
-  }
-
-  if (revents & POLLIN) {
-    // Read from remote, forward to client
-    Packet *p = AllocPacket();
-    if (p) {
-      ssize_t n = read(fd_, p->data, kPacketCapacity);
-      if (n > 0) {
-        p->size = (int)n;
-        if (owner_) { owner_->OnRemoteData(p); }
-        else { FreePacket(p); }
-      } else {
-        FreePacket(p);
-        if (n == 0 || errno != EAGAIN) {
-          if (owner_) { owner_->OnRemoteGone(); }
-          owner_ = nullptr;
-          delete this;
-          return;
-        }
-      }
-    }
-  }
-
-  if (revents & POLLOUT) {
-    if (!to_remote_.Flush(fd_)) {
-      if (owner_) { owner_->OnRemoteGone(); }
-      owner_ = nullptr;
-      delete this;
-      return;
-    }
-    if (to_remote_.bytes == 0)
-      WantWrite(false);
-  }
-
-  if (revents & (POLLERR | POLLHUP)) {
-    if (owner_) { owner_->OnRemoteGone(); }
-    owner_ = nullptr;
-    delete this;
-  }
-}
-
-
-bool TcpSocketBsd::LaunchProxy() {
-  const std::string &dom = processor_->proxy_domain();
-  if (dom.empty() || processor_->proxy_port() == 0)
+static bool ParseLinuxRoutes(struct nlmsghdr *nl, struct LinuxParsedRoute *result) {
+  struct rtmsg *rt = (struct rtmsg *)NLMSG_DATA(nl);
+  if (rt->rtm_family != AF_INET || rt->rtm_table != RT_TABLE_MAIN)
     return false;
 
-  struct addrinfo hints = {}, *ai = NULL;
-  hints.ai_family   = AF_UNSPEC;
-  hints.ai_socktype = SOCK_STREAM;
-  char portstr[8];
-  snprintf(portstr, sizeof(portstr), "%u", (unsigned)processor_->proxy_port());
-  int rc = getaddrinfo(dom.c_str(), portstr, &hints, &ai);
-  if (rc != 0 || !ai) {
-    RERROR("TcpProxy: failed to resolve %s: %s", dom.c_str(),
-           rc ? gai_strerror(rc) : "no results");
-    return false;
-  }
-
-  int rfd = socket(ai->ai_family, SOCK_STREAM, 0);
-  if (rfd < 0) {
-    RERROR("TcpProxy: socket() failed: %s", strerror(errno));
-    freeaddrinfo(ai);
-    return false;
-  }
-  fcntl(rfd, F_SETFD, FD_CLOEXEC);
-  fcntl(rfd, F_SETFL, O_NONBLOCK);
-  connect(rfd, ai->ai_addr, (socklen_t)ai->ai_addrlen);  // EINPROGRESS is ok
-  freeaddrinfo(ai);
-
-  Packet *buf_head = NULL;
-  Packet **buf_tail = &buf_head;
-  uint32 buf_bytes = 0;
-  tcp_packet_handler_.StealReplayBuffer(&buf_head, &buf_tail, &buf_bytes);
-
-  int cfd = StealFd();
-  char src_buf[kSizeOfAddress];
-  RINFO("TcpProxy: forwarding %s -> %s:%u (%u buffered bytes)",
-        endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, src_buf) : "(unknown)",
-        dom.c_str(), (unsigned)processor_->proxy_port(), buf_bytes);
-
-  new TcpProxySocketBsd(network_, cfd, rfd, buf_head, buf_tail, buf_bytes);
-  delete this;  // fd_ already stolen — CloseSocket() will not double-close
-  return true;
-}
-
-void TcpSocketBsd::Periodic() {
-  uint32 now_sec = (uint32)(OsGetMilliseconds() / 1000);
-
-  // Deferred close: hybrid_tcp sockets are kept alive briefly after handshake
-  // to mimic normal HTTPS session lifetime, then closed gracefully.
-  if (deferred_close_at_ != 0) {
-    if (now_sec >= deferred_close_at_) {
-      CloseSocketAndDestroy();
-      return;
-    }
-    // During the deferred window, send HTTP/2-like PING frames (~1/sec) to
-    // make the idle TCP session look like an active HTTPS/2 connection.
-    // HTTP/2 PING = 9-byte frame header + 8 bytes opaque data = 17 bytes,
-    // wrapped in a TLS Application Data record = 22 bytes total.
-    if (writable_ && tcp_packet_handler_.client_hello_parsed()) {
-      Packet *pkt = AllocPacket();
-      if (pkt) {
-        // Build the TLS Application Data record directly (marked prepared).
-        // Content: HTTP/2 PING frame with random opaque data.
-        static const uint payload_size = 17;
-        pkt->data[0] = 0x17; pkt->data[1] = 0x03; pkt->data[2] = 0x03;
-        pkt->data[3] = 0x00; pkt->data[4] = payload_size;
-        // HTTP/2 PING frame header: length=8, type=PING(6), flags=0, stream=0
-        pkt->data[5]  = 0x00; pkt->data[6]  = 0x00; pkt->data[7]  = 0x08;
-        pkt->data[8]  = 0x06; pkt->data[9]  = 0x00;
-        pkt->data[10] = 0x00; pkt->data[11] = 0x00; pkt->data[12] = 0x00; pkt->data[13] = 0x00;
-        OsGetRandomBytes(pkt->data + 14, 8);  // random opaque ping data
-        pkt->size = 5 + payload_size;
-        pkt->prepared = true;
-        WritePacket(pkt);
-      }
-    }
-  }
-
-  // Idle timeout for unauthenticated incoming connections:
-  // if nothing has been received within 30 seconds, close the socket.
-  // This prevents resource exhaustion from clients that connect but never send data.
-  // Skip if a WireGuard packet already came through — the socket is in use for hybrid_tcp.
-  static const uint32 kUnauthIdleTimeoutSec = 30;
-  if ((endpoint_protocol_ & kPacketProtocolIncomingConnection) &&
-      !wg_packet_received_ &&
-      !tcp_packet_handler_.client_hello_parsed() &&
-      !tcp_packet_handler_.error()) {
-    if (now_sec - connect_timestamp_ >= kUnauthIdleTimeoutSec) {
-      char buf[kSizeOfAddress];
-      RERROR("Idle timeout for unauthenticated connection from %s — closing",
-             endpoint_.sin.sin_family ? PrintIpAddr(endpoint_, buf) : "(unknown)");
-      CloseSocketAndDestroy();
-      return;
-    }
-  }
-
-  if (proxy_timeout_ == 0)
-    return;
-  if (--proxy_timeout_ > 0)
-    return;
-  // Timer expired: no valid WireGuard packet arrived after TLS ClientHello.
-  // This is a real browser — launch the proxy.
-  RINFO("TcpProxy: timeout after TLS ClientHello, proxying to upstream");
-  if (!LaunchProxy())
-    CloseSocketAndDestroy();
-  // *this may be deleted — do not touch after this point.
-}
-
-void TcpSocketBsd::DoRead() {
-  ssize_t bytes_read = readv(fd_, network_->iov_, NetworkBsd::kMaxIovec);
-  ssize_t bytes_read_org = bytes_read;
-  if (bytes_read < 0) {
-    if (errno != EAGAIN) {
-      RERROR("tcp readv says error code: %d", errno);
-      CloseSocketAndDestroy();
-    }
-    return;
-  }
-
-  NetworkBsd *net = network_;
-  for (size_t j = 0; bytes_read; j++) {
-    size_t m = std::min<size_t>(bytes_read, net->iov_[j].iov_len);
-    Packet *p = net->iov_packets_[j];
-    p->size = (int)m;
-    bytes_read -= m;
-    tcp_packet_handler_.QueueIncomingPacket(p);
-    net->ReallocateIov(j);
-  }
-
-  bool got_wireguard_packet = false;
-  while (Packet *p = tcp_packet_handler_.GetNextWireguardPacket()) {
-    got_wireguard_packet = true;
-    wg_packet_received_ = true;
-    p->protocol = endpoint_protocol_;
-    p->addr = endpoint_;
-    processor_->HandleUdpPacket(p, network_->overload_);
-    tcp_packet_handler_.ClearReplayBuffer();  // authenticated — free replay mirror
-  }
-
-  // Distinguish browser from TunSafe client without a timer:
-  //
-  // TunSafe client: sends fake ClientHello (0x1603) immediately followed by
-  //   ChangeCipherSpec + encrypted WireGuard data — all usually in the same
-  //   TCP segment.  By the time GetNextWireguardPacket() returns, either
-  //   got_wireguard_packet==true or queue_size()>0 (more data pending).
-  //
-  // Real browser: sends ClientHello, then STOPS and waits for ServerHello.
-  //   After GetNextWireguardPacket() the queue is empty and no WG packet arrived.
-  //
-  // So: ClientHello parsed + empty queue + no WG packet = browser → proxy now.
-  // If ClientHello hasn't been fully parsed yet (split across reads), arm a
-  // 1-second fallback timer so we don't block forever.
-  if (!processor_->proxy_domain().empty() && processor_->proxy_port() != 0) {
-    if (tcp_packet_handler_.client_hello_parsed() && !got_wireguard_packet &&
-        tcp_packet_handler_.queue_size() == 0) {
-      // Empty queue right after ClientHello — this is a browser.
-      if (!LaunchProxy())
-        CloseSocketAndDestroy();
-      return;
-    }
-    if (tcp_packet_handler_.real_tls_detected() && proxy_timeout_ == 0 &&
-        !got_wireguard_packet) {
-      proxy_timeout_ = 1;  // fallback: ClientHello split across reads
-    }
-    if (got_wireguard_packet)
-      proxy_timeout_ = 0;  // disarm — authenticated TunSafe client
-  }
-
-  if (tcp_packet_handler_.error() || bytes_read_org == 0) {
-    // plaintext HTTP or other unrecognised stream → proxy or close
-    if (tcp_packet_handler_.error() && !processor_->proxy_domain().empty()) {
-      if (!LaunchProxy())
-        CloseSocketAndDestroy();
-    } else {
-      CloseSocketAndDestroy();
-    }
-  }
-}
-
-
-void TcpSocketBsd::DoWrite() {
-  enum { kMaxIoWrite = 16 };
-  struct iovec vecs[kMaxIoWrite];
-  size_t nvec = 0;
-
-  // Drain any fake TLS records (post-ServerHello handshake simulation)
-  // that must be sent before the first real data packet.
-  Packet *fake = tcp_packet_handler_.StealFakeOutPackets();
-  for (Packet *fp = fake; fp && nvec < kMaxIoWrite; fp = Packet_NEXT(fp)) {
-    vecs[nvec].iov_base = fp->data;
-    vecs[nvec].iov_len  = fp->size;
-    nvec++;
-  }
-  if (fake && nvec > 0) {
-    ssize_t n = writev(fd_, vecs, nvec);
-    // Free fake packets regardless of write result
-    while (fake) { Packet *nxt = Packet_NEXT(fake); FreePacket(fake); fake = nxt; }
-    if (n < 0) {
-      if (errno != EAGAIN) {
-        RERROR("tcp writev (fake records) error: %d", errno);
-        CloseSocketAndDestroy();
-        return;
-      }
-      writable_ = false;
-      SetPollFlags(POLLIN | POLLOUT);
-      return;
-    }
-    nvec = 0;
-  }
-
-  Packet *p = wqueue_;
-  nvec = 0;
-  for (; p && nvec < kMaxIoWrite; p = Packet_NEXT(p)) {
-    if (!p->prepared)
-      tcp_packet_handler_.PrepareOutgoingPackets(p);
-
-    if (p->size != 0) {
-      vecs[nvec].iov_base = p->data;
-      vecs[nvec].iov_len = p->size;
-      nvec++;
-    }
-  }
-  if (nvec == 0)
-    return;
-
-  ssize_t n = writev(fd_, vecs, nvec);
-
-  if (n < 0) {
-    if (errno != EAGAIN) {
-      RERROR("tcp writev says error code: %d", errno);
-      CloseSocketAndDestroy();
-    } else {
-      writable_ = false;
-      SetPollFlags(POLLIN | POLLOUT);
-    }
-    return;
-  }
-  // discard those initial n bytes worth of packets
-  p = wqueue_;
-  while (n) {
-    if (n < p->size) {
-      p->data += n, p->size -= n;
+  struct rtattr *attr = (struct rtattr *)RTM_RTA(rt);
+  int len = RTM_PAYLOAD(nl);
+  int has = 0;
+  for(; RTA_OK(attr, len); attr = RTA_NEXT(attr, len)) {
+    switch(attr->rta_type) {
+    case RTA_OIF:
+      has |= 1;
+      if_indextoname(*(int *)RTA_DATA(attr), result->ifname);
+      break;
+    case RTA_GATEWAY:
+      has |= 2;
+      memcpy(&result->gateway, RTA_DATA(attr), sizeof(result->gateway));
+      break;
+    case RTA_DST:
+      has |= 4;
+      memcpy(&result->dst, RTA_DATA(attr), sizeof(result->dst));
       break;
     }
-    n -= p->size;
-    FreePacket(exch(p, Packet_NEXT(p)));
-    wqueue_packets_--;
   }
-  if (!(wqueue_ = p))
-    wqueue_end_ = &wqueue_;
+  result->has = has;
+  return true;
 }
 
-void TcpSocketBsd::CloseSocketAndDestroy() {
-  delete this;
+static bool GetDefaultRoute(char *iface, size_t iface_size, uint32 *gw_addr) {
+  enum {BUFSIZE = 8192};
+  struct nlmsghdr *nl;
+  struct rtmsg *rt;
+  struct LinuxParsedRoute parsed_route;
+  char buffer[BUFSIZE];
+  int fd, len, pid = getpid();
+  bool result = false;
+
+  if ((fd = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_ROUTE)) < 0)
+    return false;
+
+  size_t msg_size = NLMSG_SPACE(sizeof(struct rtmsg));
+  memset(buffer, 0, msg_size);
+  nl = (struct nlmsghdr *)buffer;
+  nl->nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+  nl->nlmsg_type = RTM_GETROUTE;
+  nl->nlmsg_flags = NLM_F_DUMP | NLM_F_REQUEST;
+  nl->nlmsg_seq = 1;
+  nl->nlmsg_pid = pid;
+  rt = (struct rtmsg *)NLMSG_DATA(nl);
+  rt->rtm_family = AF_INET;
+  rt->rtm_table = RT_TABLE_MAIN;
+  if (send(fd, nl, msg_size, 0) != msg_size) {
+    RERROR("write to route socket failed");
+    goto done;
+  }
+  do {
+    if ((len = recv(fd, buffer, BUFSIZE, 0)) < 0) {
+      RERROR("read from route socket failed");
+      goto done;
+    }
+    for (nl = (struct nlmsghdr *)buffer; NLMSG_OK(nl, len); nl = NLMSG_NEXT(nl, len)) {
+      if (nl->nlmsg_seq != 1 || nl->nlmsg_pid != pid)
+        continue;
+      if (nl->nlmsg_type == NLMSG_DONE)
+        goto done;
+      if (nl->nlmsg_type == NLMSG_ERROR) {
+        RERROR("Error in recieved packet");
+        goto done;
+      }
+      if (ParseLinuxRoutes(nl, &parsed_route) && (parsed_route.has & (1+2+4)) == (1+2)) {
+        size_t l = strlen(parsed_route.ifname);
+        if (l < iface_size) {
+          *gw_addr = ReadBE32(&parsed_route.gateway);
+          memcpy(iface, parsed_route.ifname, l + 1);
+          result = true;
+        }
+      }
+    }
+  } while ((nl->nlmsg_flags & NLM_F_MULTI) != 0);
+done:
+  close(fd);
+  return result;
+}
+#endif  // defined(OS_LINUX)
+
+#if defined(OS_MACOSX)
+int open_tun(char *devname, size_t devname_size) {
+  struct sockaddr_ctl sc;
+  struct ctl_info ctlinfo = {0};
+  int fd;
+
+  memcpy(ctlinfo.ctl_name, UTUN_CONTROL_NAME, sizeof(UTUN_CONTROL_NAME));
+
+  for(int i = 0; i < 256; i++) {
+    fd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+    if (fd < 0) {
+      RERROR("socket(SYSPROTO_CONTROL) failed");
+      return -1;
+    }
+
+    if (ioctl(fd, CTLIOCGINFO, &ctlinfo) == -1) {
+      RERROR("ioctl(CTLIOCGINFO) failed: %d", errno);
+      close(fd);
+      return -1;
+    }
+    sc.sc_id = ctlinfo.ctl_id;
+    sc.sc_len = sizeof(sc);
+    sc.sc_family = AF_SYSTEM;
+    sc.ss_sysaddr = AF_SYS_CONTROL;
+    sc.sc_unit = i + 1;
+    if (connect(fd, (struct sockaddr *)&sc, sizeof(sc)) == 0) {
+      socklen_t devname_size2 = devname_size;
+      if (getsockopt(fd, SYSPROTO_CONTROL, UTUN_OPT_IFNAME, devname, &devname_size2)) {
+        RERROR("getsockopt(UTUN_OPT_IFNAME) failed");
+        close(fd);
+        return -1;
+      }
+
+
+      return fd;
+    }
+    close(fd);
+  }
+  return -1;  
 }
 
-//////////////////////////////////////////////////////////////////////////////////////////////
-// TcpProxySocketBsd - transparent byte-level proxy for unrecognized TLS clients
-//////////////////////////////////////////////////////////////////////////////////////////////
+#elif defined(OS_FREEBSD)
+int open_tun(char *devname, size_t devname_size) {
+  char buf[32];
+  int tun_fd;
+  // First open an existing tun device
+  for(int i = 0; i < 256; i++) {
+    sprintf(buf, "/dev/tun%d", i);
+    tun_fd = open(buf, O_RDWR);
+    if (tun_fd >= 0) goto did_open;
+  }
+  tun_fd = open("/dev/tun", O_RDWR);
+  if (tun_fd < 0)
+    return tun_fd;
+did_open:
+  if (!fdevname_r(tun_fd, devname, devname_size)) {
+    RERROR("Unable to get name of tun device");
+    close(tun_fd);
+    return -1;
+  }
+  int flags = IFF_POINTOPOINT | IFF_MULTICAST;
+  if (ioctl(tun_fd, TUNSIFMODE, &flags) < 0) {
+    RERROR("ioctl(TUNSIFMODE) failed");
+    close(tun_fd);
+    return -1;
 
-//////////////////////////////////////////////////////////////////////////////////////////////
-NotificationPipeBsd::NotificationPipeBsd(NetworkBsd *network)
-    : BaseSocketBsd(network),
-      injected_cb_(NULL) {
+  }
+  flags = 1;
+  if (ioctl(tun_fd, TUNSIFHEAD, &flags) < 0) {
+    RERROR("ioctl(TUNSIFHEAD) failed");
+    close(tun_fd);
+    return -1;
+  }
+  return tun_fd;
+}
 
-  if (!HasFreePollSlot())
-    tunsafe_die("no free poll slots");
-  
-#if !defined(OS_MACOSX)
-  if (pipe2(pipe_fds_, O_CLOEXEC | O_NONBLOCK))
-    tunsafe_die("pipe2 failed");
+#elif defined(OS_LINUX)
+int open_tun(char *devname, size_t devname_size) {
+  int fd, err;
+  struct ifreq ifr;
+
+  fd = open("/dev/net/tun", O_RDWR);
+  if (fd < 0)
+    return fd;
+
+  memset(&ifr, 0, sizeof(ifr));
+  ifr.ifr_flags = IFF_TUN | IFF_NO_PI;
+
+  my_strlcpy(ifr.ifr_name, sizeof(ifr.ifr_name), devname);
+  if ((err = ioctl(fd, TUNSETIFF, (void *) &ifr)) < 0) {
+    close(fd);
+    return err;
+  }
+  my_strlcpy(devname, devname_size, ifr.ifr_name);
+  return fd;
+}
+#endif
+
+TunsafeBackendBsd::TunsafeBackendBsd() {
+  devname_[0] = 0;
+  tun_interface_gone_ = false;
+}
+
+TunsafeBackendBsd::~TunsafeBackendBsd() {
+}
+
+static uint32 CidrToNetmaskV4(int cidr) {
+  return cidr == 32 ? 0xffffffff : 0xffffffff << (32 - cidr);
+}
+
+void TunsafeBackendBsd::AddRoute(uint32 ip, uint32 cidr, uint32 gw, const char *dev) {
+  uint32 ip_be, gw_be;
+  WriteBE32(&ip_be, ip);
+  WriteBE32(&gw_be, gw);
+  AddRoute(AF_INET, &ip_be, cidr, &gw_be, dev);
+}
+
+static void AddOrRemoveRoute(const RouteInfo &cd, bool remove) {
+  char buf1[kSizeOfAddress], buf2[kSizeOfAddress];
+
+  print_ip_prefix(buf1, cd.family, cd.ip, cd.cidr);
+  print_ip_prefix(buf2, cd.family, cd.gw, -1);
+
+#if defined(OS_LINUX)
+  const char *cmd = remove ? "del" : "add";
+  const char *proto = (cd.family == AF_INET) ? NULL : "-6";
+  if (cd.dev.empty()) {
+    RunCommand("/sbin/ip %s route %s %s via %s", proto, cmd, buf1, buf2);
+  } else {
+    RunCommand("/sbin/ip %s route %s %s dev %s", proto, cmd, buf1, cd.dev.c_str());
+  }
+#elif defined(OS_MACOSX) || defined(OS_FREEBSD)
+  const char *cmd = remove ? "delete" : "add";
+  if (cd.family == AF_INET) {
+    RunCommand("/sbin/route -q %s %s %s", cmd, buf1, buf2);
+  } else {
+    RunCommand("/sbin/route -q %s -inet6 %s %s", cmd, buf1, buf2);
+  }
+#endif
+}
+
+bool TunsafeBackendBsd::AddRoute(int family, const void *dest, int dest_prefix, const void *gateway, const char *dev) {
+  RouteInfo c;
+
+  c.dev = dev ? dev : "";
+  c.family = family;
+  size_t len = (family == AF_INET) ? 4 : 16;
+  memcpy(c.ip, dest, len);
+  memcpy(c.gw, gateway, len);
+  c.cidr = dest_prefix;
+  cleanup_commands_.push_back(c);
+  AddOrRemoveRoute(c, false);
+  return true;
+}
+
+void TunsafeBackendBsd::DelRoute(const RouteInfo &cd) {
+  AddOrRemoveRoute(cd, true);
+}
+
+static bool IsIpv6AddressSet(const void *p) {
+  return (ReadLE64(p) | ReadLE64((char*)p + 8)) != 0;
+}
+ 
+// Called to initialize tun
+bool TunsafeBackendBsd::Configure(const TunConfig &&config, TunConfigOut *out) {
+  char buf[kSizeOfAddress];
+  char buf2[kSizeOfAddress];
+
+  if (!RunPrePostCommand(config.pre_post_commands.pre_up)) {
+    RERROR("Pre command failed!");
+    return false;
+  }
+
+  out->enable_neighbor_discovery_spoofing = false;
+
+  if (!InitializeTun(devname_))
+    return false;
+
+  const WgCidrAddr *ipv4_addr = NULL;
+  const WgCidrAddr *ipv6_addr = NULL;
+  for (auto it = config.addresses.begin(); it != config.addresses.end(); ++it) {
+    if (it->size == 32 && ipv4_addr == NULL)
+      ipv4_addr = &*it;
+    else if (it->size == 128 && ipv6_addr == NULL)
+      ipv6_addr = &*it;
+  }
+  if (ipv4_addr == NULL) {
+    RERROR("The TUN adapter requires an IPv4 address");
+    return false;
+  }
+  uint32 ipv4_netmask = CidrToNetmaskV4(ipv4_addr->cidr);
+  uint32 ipv4_ip = ReadBE32(ipv4_addr->addr);
+
+  addresses_to_remove_ = config.addresses;
+
+#if defined(OS_LINUX)
+  RunCommand("/sbin/ip address flush dev %s scope global", devname_);
+  for(const WgCidrAddr &a : config.addresses)
+    RunCommand("/sbin/ip address add dev %s %s", devname_, print_ip_prefix(buf, a.size == 32 ? AF_INET : AF_INET6, a.addr, a.cidr));
+  RunCommand("/sbin/ip link set dev %s mtu %d up", devname_, config.mtu);
 #else
-  if (pipe(pipe_fds_))
-    tunsafe_die("pipe failed");
-  for (int i = 0; i < 2; i++) {
-    fcntl(pipe_fds_[i], F_SETFD, FD_CLOEXEC);
-    fcntl(pipe_fds_[i], F_SETFL, O_NONBLOCK);
+  for(const WgCidrAddr &a : config.addresses) {
+    if (a.size == 32) {
+      RunCommand("/sbin/ifconfig %s inet %s %s add", devname_, print_ip_prefix(buf, AF_INET, a.addr, a.cidr), print_ip_prefix(buf2, AF_INET, a.addr, -1));
+    } else {
+      RunCommand("/sbin/ifconfig %s inet6 %s add", devname_, print_ip_prefix(buf, AF_INET6, a.addr, a.cidr));
+    }
   }
+  RunCommand("/sbin/ifconfig %s mtu %d up", devname_, config.mtu);
 #endif
 
 
-  InitPollSlot(pipe_fds_[0], POLLIN);
-}
+#if !defined(OS_ANDROID)
+  char default_iface[16];
+  uint32 ipv4_default_gw;
+  bool found_ipv4_route = GetDefaultRoute(default_iface, sizeof(default_iface), &ipv4_default_gw);
+  for (auto it = config.excluded_routes.begin(); it != config.excluded_routes.end(); ++it) {
+    if (it->size == 32) {
+      if (!found_ipv4_route) {
+        RERROR("Unable to determine default interface.");
+        return false;
+      }
+      AddRoute(ReadBE32(it->addr), it->cidr, ipv4_default_gw, NULL);
+    } else if (it->size == 128) {
+      RERROR("default_route_endpoint_v6 not supported");
+      return false;
+    }
+  }
+#endif  // !defined(OS_ANDROID)
 
-NotificationPipeBsd::~NotificationPipeBsd() {
-}
+  // Add all the extra routes
+  for (auto it = config.included_routes.begin(); it != config.included_routes.end(); ++it) {
+    if (it->cidr == 0) {
+      if (it->size == 32) {
+        AddRoute(0x00000000, 1, ipv4_ip, devname_);
+        AddRoute(0x80000000, 1, ipv4_ip, devname_);
+      } else if (it->size == 128 && ipv6_addr) {
+        static const uint8 matchall_1_route[17] = {0x80, 0, 0, 0};
+        AddRoute(AF_INET6, matchall_1_route + 1, 1, ipv6_addr->addr, devname_);
+        AddRoute(AF_INET6, matchall_1_route + 0, 1, ipv6_addr->addr, devname_);
+      }
+      continue;
+    }
 
-void NotificationPipeBsd::InjectCallback(CallbackFunc *func, void *param) {
-  CallbackState *st = new CallbackState;
-  st->func = func;
-  st->param = param;
-  // todo: support multiple writers?
-  st->next = injected_cb_.exchange(NULL);
-  injected_cb_.exchange(st);
-  write(pipe_fds_[1], "", 1);
-}
+    // On linux, don't add a route that equals one of the addresses
+#if defined(OS_LINUX)
+    if (IsWgCidrAddrSubsetOfAny(*it, config.addresses))
+      continue;
+#endif
 
-void NotificationPipeBsd::Wakeup() {
-  write(pipe_fds_[1], "", 1);
-}
-
-void NotificationPipeBsd::HandleEvents(int revents) {
-  if (revents & (POLLERR | POLLHUP | POLLNVAL)) {
-    RERROR("Error with pipe() polling");
-    CloseSocket();
-  } else if (revents & POLLIN) {
-    char tmp[64];
-    read(fd_, tmp, sizeof(tmp));
-    if (CallbackState *cb = injected_cb_.exchange(NULL)) {
-      do {
-        CallbackState *next = cb->next;
-        cb->func(cb->param);
-        cb = next;
-      } while (cb);
+    if (it->size == 32) {
+      AddRoute(ReadBE32(it->addr), it->cidr, ipv4_ip, devname_);
+    } else if (it->size == 128 && ipv6_addr) {
+      AddRoute(AF_INET6, it->addr, it->cidr, ipv6_addr->addr, devname_);
     }
   }
 
+  RunPrePostCommand(config.pre_post_commands.post_up);
+
+  pre_down_ = std::move(config.pre_post_commands.pre_down);
+  post_down_ = std::move(config.pre_post_commands.post_down);
+
+  return true;
 }
+
+void TunsafeBackendBsd::CleanupRoutes() {
+  char buf[kSizeOfAddress];
+
+  RunPrePostCommand(pre_down_);
+
+  for(auto it = cleanup_commands_.begin(); it != cleanup_commands_.end(); ++it) {
+    if (!tun_interface_gone_ || strcmp(it->dev.c_str(), devname_) != 0)
+      DelRoute(*it);
+  }
+
+#if defined(OS_LINUX)
+  for(const WgCidrAddr &a : addresses_to_remove_)
+    RunCommand("/sbin/ip address del dev %s %s", devname_, print_ip_prefix(buf, a.size == 32 ? AF_INET : AF_INET6, a.addr, a.cidr));
+#else
+  for(const WgCidrAddr &a : addresses_to_remove_) {
+    if (a.size == 32) {
+      RunCommand("/sbin/ifconfig %s inet %s -alias", devname_, print_ip_prefix(buf, AF_INET, a.addr, -1));
+    } else {
+      RunCommand("/sbin/ifconfig %s inet6 %s -alias", devname_, print_ip_prefix(buf, AF_INET6, a.addr, -1));
+    }
+  }
+#endif
+
+  cleanup_commands_.clear();
+  addresses_to_remove_.clear();
+
+  RunPrePostCommand(post_down_);
+
+  pre_down_.clear();
+  post_down_.clear();
+}
+
+void TunsafeBackendBsd::SetTunDeviceName(const char *name) {
+  my_strlcpy(devname_, sizeof(devname_), name);
+}
+
+static bool RunOneCommand(const std::string &cmd) {
+  RINFO("Run: %s", cmd.c_str());
+  int exit_code = system(cmd.c_str());
+  if (exit_code) {
+    RERROR("Run Failed (%d) : %s", exit_code, cmd.c_str());
+    return false;
+  }
+  return true;
+}
+
+bool TunsafeBackendBsd::RunPrePostCommand(const std::vector<std::string> &vec) {
+  bool success = true;
+  for (auto it = vec.begin(); it != vec.end(); ++it) {
+    success &= RunOneCommand(*it);
+  }
+  return success;
+}
+
+
+static SignalCatcher *g_signal_catcher;
+static bool did_ctrlc;
+
+void SignalCatcher::SigAlrm(int sig) {
+  if (g_signal_catcher)
+    *g_signal_catcher->sigalarm_flag_ = true;
+}
+
+void SignalCatcher::SigInt(int sig) {
+  if (did_ctrlc)
+    exit(1);
+  did_ctrlc = true;
+  write(1, "Ctrl-C detected. Exiting. Press again to force quit.\n", sizeof("Ctrl-C detected. Exiting. Press again to force quit.\n") - 1);
+  // todo: fix signal safety?
+  if (g_signal_catcher)
+    *g_signal_catcher->exit_flag_ = true;
+}
+
+SignalCatcher::SignalCatcher(bool *exit_flag, bool *sigalarm_flag) {
+  assert(g_signal_catcher == NULL);
+  exit_flag_ = exit_flag;
+  sigalarm_flag_ = sigalarm_flag;
+  g_signal_catcher = this;
+
+  sigset_t mask;
+
+  // We want an alarm signal every second.
+  {
+    struct sigaction act = {0};
+    act.sa_handler = SigAlrm;
+    if (sigaction(SIGALRM, &act, NULL) < 0) {
+      RERROR("Unable to install SIGALRM handler.");
+      return;
+    }
+  }
+
+  {
+    struct sigaction act = {0};
+    act.sa_handler = SigInt;
+    if (sigaction(SIGINT, &act, NULL) < 0) {
+      RERROR("Unable to install SIGINT handler.");
+      return;
+    }
+  }
+#if defined(OS_LINUX) || defined(OS_FREEBSD)
+  sigemptyset(&mask);
+  sigaddset(&mask, SIGALRM);
+  if (sigprocmask(SIG_BLOCK, &mask, &orig_signal_mask_) < 0) {
+    perror("sigprocmask");
+    return;
+  }
+
+  {
+    struct itimerspec tv = {0};
+    struct sigevent sev;
+    timer_t timer_id;
+
+    tv.it_interval.tv_sec = 1;
+    tv.it_value.tv_sec = 1;
+
+    sev.sigev_notify = SIGEV_SIGNAL;
+    sev.sigev_signo = SIGALRM;
+    sev.sigev_value.sival_ptr = NULL;
+
+    if (timer_create(CLOCK_MONOTONIC, &sev, &timer_id) < 0) {
+      RERROR("timer_create failed");
+      return;
+    }
+
+    if (timer_settime(timer_id, 0, &tv, NULL) < 0) {
+      RERROR("timer_settime failed");
+      return;
+    }
+  }
+#elif defined(OS_MACOSX)
+  ualarm(1000000, 1000000);
+#endif
+}
+
+SignalCatcher::~SignalCatcher() {
+  g_signal_catcher = NULL;
+}
+
+void InitCpuFeatures();
+void Benchmark();
+
+const char *print_ip(char buf[kSizeOfAddress], uint32 ip) {
+  snprintf(buf, kSizeOfAddress, "%d.%d.%d.%d", (ip >> 24) & 0xff, (ip >> 16) & 0xff, (ip >> 8) & 0xff, (ip >> 0) & 0xff);
+  return buf;
+}
+
+class TunsafeBackendBsdImpl : public TunsafeBackendBsd, public NetworkBsd::NetworkBsdDelegate, public ProcessorDelegate, public PluginDelegate {
+public:
+  TunsafeBackendBsdImpl();
+  virtual ~TunsafeBackendBsdImpl();
+
+  void RunLoop();
+  virtual bool InitializeTun(char devname[16]) override;
+
+  // -- from TunInterface
+  virtual void WriteTunPacket(Packet *packet) override;
+
+  // -- from UdpInterface
+  virtual bool Configure(int listen_port_udp, int listen_port_tcp) override;
+  virtual void WriteUdpPacket(Packet *packet) override;
+  virtual void CloseOutgoingTcpForAddr(const IpAddr &addr) override;
+
+  // -- from NetworkBsdDelegate
+  virtual void OnSecondLoop(uint64 now) override;
+  virtual void RunAllMainThreadScheduled() override;
+
+  // -- from ProcessorDelegate
+  virtual void OnConnected(WgPeer *peer) override;
+  virtual void OnConnectionRetry(WgPeer *peer, uint32 attempts) override;
+
+  // -- from PluginDelegate
+  virtual void OnRequestToken(WgPeer *peer, uint32 type) override;
+
+  WireguardProcessor *processor() { return &processor_; }
+
+private:
+  // Close all TCP connections that are not pointed to by any of the peer endpoint.
+  void CloseOrphanTcpConnections();
+
+  bool is_connected_;
+  uint8 close_orphan_counter_;
+  TunsafePlugin *plugin_;
+  WireguardProcessor processor_;
+  NetworkBsd network_;
+  TunSocketBsd tun_;
+  UdpSocketBsd udp_;
+  UnixDomainSocketListenerBsd unix_socket_listener_;
+  TcpSocketListenerBsd tcp_socket_listener_;
+};
+
+TunsafeBackendBsdImpl::TunsafeBackendBsdImpl() 
+    : is_connected_(false),
+      close_orphan_counter_(0),
+      plugin_(CreateTunsafePlugin(this, &processor_)),
+      processor_(this, this, this),
+      network_(this, 1000),
+      tun_(&network_, &processor_), 
+      udp_(&network_, &processor_),
+      unix_socket_listener_(&network_, &processor_),
+      tcp_socket_listener_(&network_, &processor_) {
+  processor_.dev().SetPlugin(plugin_);
+}
+
+TunsafeBackendBsdImpl::~TunsafeBackendBsdImpl() {
+  delete plugin_;
+}
+
+bool TunsafeBackendBsdImpl::InitializeTun(char devname[16]) {
+#if defined(OS_ANDROID)
+  // On Android, the TUN fd is provided by Java via VpnService.
+  // tunsafe_android.cpp overrides InitializeTun, so this path is never called.
+  RERROR("InitializeTun should not be called on Android");
+  return false;
+#else
+  int tun_fd = open_tun(devname, 16);
+  if (tun_fd < 0) { RERROR("Error opening tun device"); return false; }
+  if (!tun_.Initialize(tun_fd)) {
+    close(tun_fd);
+    return false;
+  }
+  unix_socket_listener_.Initialize(devname);
+  return true;
+#endif  // !defined(OS_ANDROID)
+}
+
+void TunsafeBackendBsdImpl::WriteTunPacket(Packet *packet) {
+  tun_.WritePacket(packet);
+}
+
+// Called to initialize udp
+bool TunsafeBackendBsdImpl::Configure(int listen_port, int listen_port_tcp) {
+  return udp_.Initialize(listen_port) && 
+         (listen_port_tcp == 0 || tcp_socket_listener_.Initialize(listen_port_tcp));
+}
+
+void TunsafeBackendBsdImpl::WriteUdpPacket(Packet *packet) {
+  assert((packet->protocol & 0x7F) <= 2);
+  if (packet->protocol & kPacketProtocolTcp) {
+    TcpSocketBsd::WriteTcpPacket(&network_, &processor_, packet);
+  } else {
+    udp_.WritePacket(packet);
+  }
+}
+
+void TunsafeBackendBsdImpl::CloseOutgoingTcpForAddr(const IpAddr &addr) {
+  char buf[kSizeOfAddress];
+  for (TcpSocketBsd *tcp = network_.tcp_sockets(); tcp; tcp = tcp->next()) {
+    if (tcp->endpoint_protocol() == kPacketProtocolTcp &&
+        CompareIpAddr(&tcp->endpoint(), &addr) == 0) {
+      // Defer close by a random 2-8 seconds so the TCP session lifetime
+      // looks more like a real HTTPS exchange and less like an instant tunnel.
+      uint8 rnd; OsGetRandomBytes(&rnd, 1);
+      uint32 delay = 2 + (rnd % 7);  // 2..8 seconds
+      tcp->SetDeferredClose((uint32)(OsGetMilliseconds() / 1000) + delay);
+      RINFO("hybrid_tcp: TCP to %s will close in %us", PrintIpAddr(addr, buf), delay);
+      return;
+    }
+  }
+}
+
+void TunsafeBackendBsdImpl::RunLoop() {
+  if (!unix_socket_listener_.Start(network_.exit_flag()))
+    return;
+
+  SignalCatcher signal_catcher(network_.exit_flag(), network_.sigalarm_flag());
+  network_.RunLoop(&signal_catcher.orig_signal_mask_);
+  unix_socket_listener_.Stop();
+
+  tun_interface_gone_ = tun_.tun_interface_gone();
+}
+
+void TunsafeBackendBsdImpl::OnSecondLoop(uint64 now) {
+  if (!(close_orphan_counter_++ & 0xF))
+    CloseOrphanTcpConnections();
+  processor_.SecondLoop();
+}
+
+void TunsafeBackendBsdImpl::RunAllMainThreadScheduled() {
+  processor_.RunAllMainThreadScheduled();
+}
+
+void TunsafeBackendBsdImpl::OnConnected(WgPeer *peer) {
+  char buf[kSizeOfAddress], peer_buf[kSizeOfAddress];
+  const char *peer_str = "(unknown)";
+  if (peer) {
+    const IpAddr &ep = peer->endpoint();
+    if (ep.sin.sin_family != 0)
+      peer_str = PrintIpAddr(ep, peer_buf);
+  }
+
+  if (!is_connected_) {
+    const WgCidrAddr *ipv4_addr = NULL;
+    for (const WgCidrAddr &x : processor_.addr()) {
+      if (x.size == 32) { ipv4_addr = &x; break; }
+    }
+    uint32 ipv4_ip = ipv4_addr ? ReadBE32(ipv4_addr->addr) : 0;
+    RINFO("Connection established. IP %s, peer %s",
+          ipv4_ip ? print_ip(buf, ipv4_ip) : "(none)", peer_str);
+    is_connected_ = true;
+  } else {
+    RINFO("Peer connected: %s", peer_str);
+  }
+}
+
+void TunsafeBackendBsdImpl::OnConnectionRetry(WgPeer *peer, uint32 attempts) {
+  if (is_connected_ && attempts >= 3) {
+    is_connected_ = false;
+    char buf[kSizeOfAddress];
+    const char *peer_str = "(unknown)";
+    if (peer) {
+      const IpAddr &ep = peer->endpoint();
+      if (ep.sin.sin_family != 0)
+        peer_str = PrintIpAddr(ep, buf);
+    }
+    RINFO("Peer %s disconnected, reconnecting...", peer_str);
+    network_.ResetConnectingLog();  // Allow "Connecting to tcp://..." to print again
+  }
+}
+
+void TunsafeBackendBsdImpl::OnRequestToken(WgPeer *peer, uint32 type) {
+  if (!g_daemon_mode) {
+    fprintf(stderr, "A two factor token is required to login. Please enter the value from your authenticator.\nToken: ");
+    char buf[100], *rv;
+    while (!(rv = fgets(buf, 100, stdin)) && errno == EINTR) {}
+    if (rv) {
+      size_t len = strlen(buf);
+      while (len && buf[len-1] == '\n') buf[--len] = 0;
+      plugin_->SubmitToken((const uint8*)buf, strlen(buf));
+    }
+  }
+}
+
+
+// ConvertIpAddrToAddrX is static in wireguard_proto.cpp; provide a local copy
+// only when not building via tunsafe_amalgam.cpp (which includes both .cpp files).
+#ifndef TUNSAFE_AMALGAM_INCLUDE
+static WgAddrEntry::IpPort ConvertIpAddrToAddrX(const IpAddr &src) {
+  WgAddrEntry::IpPort r;
+  if (src.sin.sin_family == AF_INET) {
+    Write64(r.bytes, src.sin.sin_addr.s_addr);
+    Write64(r.bytes + 8, 0);
+    Write32(r.bytes + 16, src.sin.sin_port);
+  } else {
+    memcpy(r.bytes, &src.sin6.sin6_addr, 16);
+    Write32(r.bytes + 16, (AF_INET6 << 16) + src.sin6.sin6_port);
+  }
+  return r;
+}
+#endif // TUNSAFE_AMALGAM_INCLUDE
+
+void TunsafeBackendBsdImpl::CloseOrphanTcpConnections() {
+  // Add all incoming tcp connections into a lookup table
+  WG_HASHTABLE_IMPL<WgAddrEntry::IpPort, void*, WgAddrEntry::IpPortHasher> lookup;
+  for (TcpSocketBsd *tcp = network_.tcp_sockets(); tcp; tcp = tcp->next()) {
+    if (tcp->endpoint_protocol() == (kPacketProtocolTcp | kPacketProtocolIncomingConnection)) {
+      // Avoid deleting tcp sockets that were just born.
+      if (tcp->age == 0) {
+        tcp->age = 1;
+      } else {
+        lookup[ConvertIpAddrToAddrX(tcp->endpoint())] = tcp;
+      }
+    }
+  }
+  if (lookup.empty())
+    return;
+  // For each peer, check if it has an endpoint that matches 
+  // an entry in the lookup table, and delete it from the lookup
+  // table.
+  for(WgPeer *peer = processor_.dev().first_peer(); peer; peer = peer->next_peer()) {
+    if (peer->endpoint_protocol() == (kPacketProtocolTcp | kPacketProtocolIncomingConnection))
+      lookup.erase(ConvertIpAddrToAddrX(peer->endpoint()));
+  }
+  // The tcp connections that are still in the hashtable can be deleted
+  for(const auto &it : lookup)
+    delete (TcpSocketBsd *)it.second;
+}
+#ifndef OS_ANDROID
+int main(int argc, char **argv) {
+  CommandLineOutput cmd = {0};
+
+  InitCpuFeatures();
+
+  if (argc == 2 && strcmp(argv[1], "--benchmark") == 0) {
+    Benchmark();
+    return 0;
+  }
+
+  int rv = HandleCommandLine(argc, argv, &cmd);
+  if (!cmd.filename_to_load)
+    return rv;
+  
+#if defined(OS_MACOSX)
+  InitOsxGetMilliseconds();
+#endif
+
+
+  SetThreadName("tunsafe-m");
+
+  TunsafeBackendBsdImpl backend;
+  if (cmd.interface_name)
+    backend.SetTunDeviceName(cmd.interface_name);
+
+  DnsResolver dns_resolver(NULL);
+  if (*cmd.filename_to_load && !ParseWireGuardConfigFile(backend.processor(), cmd.filename_to_load, &dns_resolver))
+    return 1;
+  if (!backend.processor()->Start())
+    return 1;
+
+  if (cmd.daemon) {
+    g_daemon_mode = true;
+
+    fprintf(stderr, "Switching to daemon mode...\n");
+    if (daemon(0, 0) == -1)
+      perror("daemon() failed");
+  }
+
+  backend.RunLoop();
+  backend.CleanupRoutes();
+
+  return 0;
+}
+#endif  // !defined(OS_ANDROID)
