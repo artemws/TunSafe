@@ -39,6 +39,7 @@
 
 #include "wireguard.h"
 #include "wireguard_config.h"
+#include "wireguard_config_ext.h"
 #include "network_bsd.h"
 #include "tunsafe_bsd.h"
 #include "util.h"
