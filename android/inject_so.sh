@@ -21,11 +21,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -f "$APK" ]] || { echo "ERROR: APK not found: $APK"; exit 1; }
+# Convert all paths to absolute immediately (before any cd)
+ORIG_DIR="$(pwd)"
+APK="$(cd "$(dirname "$APK")" && pwd)/$(basename "$APK")"
+OUT="$ORIG_DIR/$OUT"
+LIBS="$(cd "$LIBS" && pwd)"
+# Keystore may be relative — resolve against original working dir
+if [[ "$KS" != /* ]]; then KS="$ORIG_DIR/$KS"; fi
+
+[[ -f "$APK" ]]  || { echo "ERROR: APK not found: $APK";      exit 1; }
 [[ -d "$LIBS" ]] || { echo "ERROR: libs dir not found: $LIBS"; exit 1; }
+[[ -f "$KS" ]]   || { echo "ERROR: keystore not found: $KS";  exit 1; }
 
 WORKDIR=$(mktemp -d)
-trap "rm -rf $WORKDIR" EXIT
+trap "rm -rf '$WORKDIR'" EXIT
 
 # Unzip base APK
 cp "$APK" "$WORKDIR/base.apk"
@@ -33,21 +42,21 @@ cd "$WORKDIR"
 unzip -q base.apk -d apk_contents
 
 # Inject .so files for each ABI
-# The .so built by CMake is libnative-lib.so but the app loads libtunsafe.so
 for ABI_DIR in "$LIBS"/*/; do
   ABI=$(basename "$ABI_DIR")
   mkdir -p "apk_contents/lib/$ABI"
   for SO in "$ABI_DIR"*.so; do
     [[ -f "$SO" ]] || continue
     SONAME=$(basename "$SO")
-    # .so is already named libtunsafe.so (built with add_library(tunsafe ...))
     cp "$SO" "apk_contents/lib/$ABI/$SONAME"
     echo "Injected: lib/$ABI/$SONAME"
   done
 done
 
-# Repackage
+# Repackage (must exclude existing META-INF to allow re-signing)
 cd apk_contents
+find . -name "*.MF" -o -name "*.SF" -o -name "*.RSA" -o -name "*.DSA" | \
+  xargs -r rm -f
 zip -qr "$WORKDIR/unsigned.apk" .
 cd "$WORKDIR"
 
@@ -60,7 +69,7 @@ apksigner sign \
   --ks-key-alias "$ALIAS" \
   --ks-pass "pass:$STOREPASS" \
   --key-pass "pass:$KEYPASS" \
-  --out "$OLDPWD/$OUT" \
+  --out "$OUT" \
   aligned.apk
 
 echo "APK ready: $OUT"
