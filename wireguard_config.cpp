@@ -427,7 +427,7 @@ error:
 
 bool ParseWireGuardConfigFile(WireguardProcessor *wg, const char *filename, DnsResolver *dns_resolver) {
   std::string temp;
-  RINFO("Loading file: %s", filename);
+  RINFO("Loading file [v2-EndpointTCP]: %s", filename);
   if (!LoadFileWithMaximumSize(filename, &temp, 1024 * 1024)) {
     RERROR("Unable to open: %s", filename);
     return false;
