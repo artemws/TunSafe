@@ -17,6 +17,7 @@
 #include "wireguard.cpp"
 #include "wireguard_proto.cpp"
 #include "wireguard_config.cpp"
+#include "wireguard_config_ext.cpp"
 #include "tunsafe_wg_plugin.cpp"
 #include "util.cpp"
 #include "tunsafe_threading.cpp"
