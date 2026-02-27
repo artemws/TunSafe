@@ -286,8 +286,10 @@ bool WgFileParser::ParseFlag(const char *group, const char *key, char *value) {
       // Handshake goes via TCP to this address:port; data goes via UDP to Endpoint.
       if (strncmp(value, "tcp://", 6) == 0)
         value += 6;
-      if (!ParseSockaddrInWithPort(value, &sin, dns_resolver_))
+      if (!ParseSockaddrInWithPort(value, &sin, dns_resolver_)) {
+        RERROR("EndpointTCP: unable to parse address '%s'", value);
         return false;
+      }
       peer_->SetTcpEndpoint(sin);
     } else if (strcmp(key, "PersistentKeepalive") == 0) {
       if (!peer_->SetPersistentKeepalive(atoi(value)))
