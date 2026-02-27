@@ -25,11 +25,11 @@ set(CORE_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/network_android.cpp
 )
 
-add_library(native-lib SHARED ${CORE_SOURCES})
+add_library(tunsafe SHARED ${CORE_SOURCES})
 
-target_include_directories(native-lib PRIVATE ${ROOT})
+target_include_directories(tunsafe PRIVATE ${ROOT})
 
-target_compile_options(native-lib PRIVATE
+target_compile_options(tunsafe PRIVATE
     -std=c++14
     -O2
     -DNDEBUG
@@ -42,7 +42,7 @@ target_compile_options(native-lib PRIVATE
     -Wno-unused-result
 )
 
-target_link_libraries(native-lib
+target_link_libraries(tunsafe
     log
     android
 )
