@@ -250,6 +250,10 @@ void TunsafeBackendAndroid::OnConnected(WgPeer *peer) {
 }
 
 void TunsafeBackendAndroid::OnConnectionRetry(WgPeer *peer, uint32 attempts) {
+  if (is_connected_ && attempts >= 3) {
+    is_connected_ = false;
+    network_.ResetConnectingLog();
+  }
   if (attempts == 4)
     ALOGI("Connecting...");
 }
