@@ -34,9 +34,11 @@
 #if defined(WITH_NETWORK_BSD)
 #include "network_bsd.cpp"
 #include "tunsafe_bsd.cpp"
+#if !defined(OS_ANDROID)
 #include "ts.cpp"
 #include "benchmark.cpp"
-#endif
+#endif  // !defined(OS_ANDROID)
+#endif  // defined(WITH_NETWORK_BSD)
 
 #if defined(OS_ANDROID) && defined(WITH_NETWORK_BSD)
 #include "tunsafe_android.cpp"
