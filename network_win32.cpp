@@ -3,6 +3,7 @@
 #include "stdafx.h"
 #include "network_win32.h"
 #include "wireguard_config.h"
+#include "wireguard_config_ext.h"
 #include "netapi.h"
 #include <Iphlpapi.h>
 #include <Mswsock.h>
