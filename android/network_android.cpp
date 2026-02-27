@@ -33,6 +33,7 @@
 #include "tunsafe_bsd.h"
 #include "util.h"
 #include "netapi.h"
+#include "tunsafe_ipaddr.h"
 
 #define LOG_TAG "TunSafe"
 #define ALOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
@@ -286,6 +287,59 @@ Java_com_tunsafe_app_TunSafeService_jniStart(
   if (!ParseWireGuardConfigString(proc, config.c_str(), config.size(), nullptr)) {
     ALOGE("jniStart: config parse failed");
     goto cleanup;
+  }
+
+  // Post-parse: apply EndpointTCP for each peer.
+  // ParseWireGuardConfigString skips unknown keys (EndpointTCP may not be in
+  // the compiled wireguard_config.cpp), so we do a second pass here.
+  {
+    bool in_peer = false;
+    WgPeer *cur_peer = nullptr;
+    const char *p = config.c_str();
+    while (*p) {
+      const char *nl = strchr(p, '\n');
+      size_t len = nl ? (size_t)(nl - p) : strlen(p);
+      // Trim trailing \r
+      while (len > 0 && (p[len-1] == '\r' || p[len-1] == ' ')) len--;
+      char line[512];
+      if (len < sizeof(line)) {
+        memcpy(line, p, len); line[len] = 0;
+        if (line[0] == '[') {
+          // New section — advance peer pointer if entering [Peer]
+          if (strncmp(line, "[Peer]", 6) == 0) {
+            in_peer = true;
+            // Advance cur_peer to next peer in list
+            cur_peer = cur_peer ? cur_peer->next_peer()
+                                : proc->dev().first_peer();
+          } else {
+            in_peer = false;
+          }
+        } else if (in_peer && cur_peer) {
+          char *eq = strchr(line, '=');
+          if (eq) {
+            // Trim key
+            char *ke = eq - 1;
+            while (ke > line && *ke == ' ') ke--;
+            *(ke+1) = 0;
+            // Trim value
+            const char *val = eq + 1;
+            while (*val == ' ') val++;
+            if (strcmp(line, "EndpointTCP") == 0) {
+              if (strncmp(val, "tcp://", 6) == 0) val += 6;
+              IpAddr sin;
+              if (ParseSockaddrInWithPort(val, &sin, nullptr)) {
+                cur_peer->SetTcpEndpoint(sin);
+                ALOGI("EndpointTCP: set %s for peer", val);
+              } else {
+                ALOGE("EndpointTCP: cannot parse '%s'", val);
+              }
+            }
+          }
+        }
+      }
+      if (!nl) break;
+      p = nl + 1;
+    }
   }
 
   if (!proc->Start()) {
